@@ -1,0 +1,13 @@
+{
+  "name": "mxmp-sequence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Шаговый секвенсор (piano roll) для M-VAVE FM-1 + лупы Web Audio. Zero-build, чистый JS без зависимостей.",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "test": "node tools/headless-test.js",
+    "probe": "node tools/probe-audio.js"
+  }
+}

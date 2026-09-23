@@ -1,0 +1,351 @@
+/**
+ * headless-test.js — проверка ядра без браузера (виртуальные часы и таймеры).
+ *
+ * Подменяем: AudioContext (currentTime двигаем вручную), setTimeout (копим в
+ * «таймерной карте» и «срабатываем» по виртуальному времени), MIDI-выход
+ * (записываем отправленные байты с точным временем).
+ *
+ * Секции:
+ *   A. Сетка шага: дрейф за 10 минут, ровность проходов лупа.
+ *   B. Ноты: парность noteOn/noteOff, gate, velocity.
+ *   C. Смена BPM: применяется на границе шага, луп пересчитывает скорость.
+ *   D. Стоп: all-notes-off, отмена очередей, фейд лупа, повторный стоп.
+ *   E. Визуальная очередь: порядок шагов и запаздывание подсветки.
+ *
+ * Запуск: npm test
+ */
+import { SequencerEngine, parseBpmFromName } from '../engine.js';
+
+/* ==================== фиктивный Web Audio ==================== */
+
+class FakeParam {
+  constructor(v) { this.value = v; }
+  setTargetAtTime(v) { this.value = v; }
+}
+class FakeGain {
+  constructor() { this.gain = new FakeParam(1); }
+  connect() { return arguments[0]; }
+  disconnect() {}
+}
+class FakeSource {
+  constructor() {
+    this.buffer = null;
+    this.playbackRate = new FakeParam(1);
+    this.onended = null;
+    this.startTime = null;
+    this.stopTime = null;
+  }
+  connect() { return arguments[0]; }
+  disconnect() {}
+  start(t) { this.startTime = t; }
+  stop(t) { this.stopTime = t; }
+}
+class FakeAudioContext {
+  constructor(sources) {
+    this.currentTime = 0;
+    this.state = 'running';
+    this.sampleRate = 48000;
+    this.baseLatency = 0.01;
+    this.outputLatency = 0.03;
+    this.destination = {};
+    this._sources = sources;
+  }
+  createGain() { return new FakeGain(); }
+  createBufferSource() { const s = new FakeSource(); this._sources.push(s); return s; }
+  resume() { this.state = 'running'; return Promise.resolve(); }
+}
+
+/* ==================== «испытательный стенд» ==================== */
+
+function makeHarness({ bpm = 120 } = {}) {
+  const sources = [];
+  const ctx = new FakeAudioContext(sources);
+  const timers = new Map(); // id → { fn, ms, ctxNow, id }
+  let nextTimerId = 1;
+
+  const sent = []; // история MIDI-сообщений
+  const backend = {
+    name: 'fake-midi',
+    sendNow(bytes) { sent.push({ bytes: [...bytes], ctxTime: ctx.currentTime }); },
+    sendScheduled(bytes) { throw new Error('timestamp-режим в тестах не используется'); },
+  };
+
+  const engine = new SequencerEngine({
+    audioContext: ctx,
+    bpm,
+    timerApi: { setInterval: () => 1, clearInterval: () => {} }, // шедулер двигаем вручную
+    raf: null,
+    setTimer: (fn, ms) => {
+      const id = nextTimerId++;
+      timers.set(id, { fn, ms, ctxNow: ctx.currentTime, id });
+      return id;
+    },
+    clearTimer: (id) => { timers.delete(id); },
+    perfNow: () => ctx.currentTime * 1000,
+  });
+
+  // Фиктивный буфер лупа: 2.0 с = ровно 1 такт при 120 BPM
+  engine.loop.url = 'fake_120bpm.wav';
+  engine.loop.buffer = { duration: 2.0, sampleRate: 48000 };
+  engine.loop.sourceBpm = 120;
+  engine.loop.bars = 1;
+  engine.midi.connect(backend);
+
+  const h = {
+    ctx, engine, backend, sources, timers, sent,
+
+    /** «Сработать» таймерам, чьё время уже наступило. */
+    fireDue(until) {
+      const due = [...timers.values()]
+        .filter((t) => t.ctxNow + t.ms / 1000 <= until + 1e-9)
+        .sort((a, b) => (a.ctxNow + a.ms / 1000) - (b.ctxNow + b.ms / 1000) || a.id - b.id);
+      for (const t of due) {
+        timers.delete(t.id);
+        const at = t.ctxNow + t.ms / 1000;
+        // «Телепорт» ровно в момент срабатывания: как настоящий setTimeout,
+        // сработавший вовремя. Отправленные сообщения получают точное время.
+        const saved = ctx.currentTime;
+        ctx.currentTime = at;
+        t.fn();
+        ctx.currentTime = saved;
+      }
+      return due;
+    },
+
+    /** Сдвинуть виртуальное время на seconds кусочками по slice (как setInterval 25 мс). */
+    advance(seconds, slice = 0.025) {
+      const end = ctx.currentTime + seconds;
+      while (ctx.currentTime < end - 1e-9) {
+        ctx.currentTime = Math.min(end, ctx.currentTime + slice);
+        engine.tick();
+        h.fireDue(ctx.currentTime);
+      }
+    },
+  };
+  return h;
+}
+
+/* ==================== отчётность ==================== */
+
+let totalFails = 0;
+const fmtMs = (s) => (s * 1000).toFixed(3);
+
+function section(name, body) {
+  console.log(`\n=== ${name} ===`);
+  let fails = 0;
+  const check = (cond, label) => {
+    if (!cond) { fails++; console.log(`  ✗ ${label}`); }
+    return cond;
+  };
+  return body(check).then(() => {
+    console.log(`  ${name.split('.')[0]}: ${fails ? 'FAIL' : 'PASS'}`);
+    totalFails += fails;
+  });
+}
+
+/* ==================== A. сетка и дрейф ==================== */
+
+await section('A. Сетка: 10 минут при 120 BPM', async (check) => {
+  const h = makeHarness({ bpm: 120 });
+  await h.engine.initAudio();
+  h.engine.matrix[0][0] = 100;
+  h.engine.start();
+
+  const times = [];
+  const SLICE = 0.025;
+  const runSec = 600;
+  for (let i = 0; i < Math.round(runSec / SLICE); i++) {
+    h.advance(SLICE);
+    const ev = h.engine.consumeDueSteps(h.ctx.currentTime);
+    if (ev) times.push(ev.time);
+  }
+
+  const stepDur = 60 / 120 / 4;
+  let minD = Infinity, maxD = -Infinity, maxDev = 0;
+  for (let k = 1; k < times.length; k++) {
+    const d = times[k] - times[k - 1];
+    minD = Math.min(minD, d); maxD = Math.max(maxD, d);
+  }
+  for (let k = 0; k < times.length; k++) {
+    maxDev = Math.max(maxDev, Math.abs(times[k] - (times[0] + k * stepDur)));
+  }
+  const expectedSteps = Math.floor((runSec - 0.08) / stepDur) + 1;
+  console.log(`  событий шага: ${times.length} (ожидалось ${expectedSteps})`);
+  console.log(`  интервал: ${fmtMs(minD)}..${fmtMs(maxD)} мс (должен быть ${fmtMs(stepDur)})`);
+  console.log(`  макс. отклонение от идеальной прямой: ${(maxDev * 1000).toExponential(2)} мс`);
+  check(times.length === expectedSteps, `количество шагов ${times.length} ≠ ${expectedSteps}`);
+  check(Math.abs(minD - stepDur) < 1e-9 && Math.abs(maxD - stepDur) < 1e-9, 'интервал шага ≠ stepDuration');
+  check(maxDev < 1e-6, 'дрейф сетки за 10 минут');
+
+  const starts = h.sources.map((s) => s.startTime).filter((v) => v != null).sort((a, b) => a - b);
+  let lmin = Infinity, lmax = -Infinity;
+  for (let k = 1; k < starts.length; k++) {
+    const d = starts[k] - starts[k - 1];
+    lmin = Math.min(lmin, d); lmax = Math.max(lmax, d);
+  }
+  const rates = [...new Set(h.sources.map((s) => +s.playbackRate.value.toFixed(6)))];
+  console.log(`  проходов лупа: ${starts.length}, интервал ${fmtMs(lmin)}..${fmtMs(lmax)} мс (такт = 2000.000), rate: ${rates.join(', ')}`);
+  check(starts.length >= 299 && starts.length <= 301, 'количество проходов лупа');
+  check(Math.abs(lmin - 2.0) < 1e-9 && Math.abs(lmax - 2.0) < 1e-9, 'проходы лупа не по границам тактов');
+  check(rates.length === 1 && Math.abs(rates[0] - 1) < 1e-9, 'playbackRate при 120 BPM ≠ 1');
+});
+
+/* ==================== B. ноты и gate ==================== */
+
+await section('B. Ноты: парность noteOn/noteOff, gate, velocity', async (check) => {
+  const h = makeHarness({ bpm: 120 });
+  await h.engine.initAudio();
+  h.engine.matrix[0][0] = 100;
+  h.engine.matrix[1][4] = 90;
+  h.engine.matrix[2][8] = 110;
+  h.engine.matrix[3][12] = 100;
+  h.engine.start();
+  h.advance(8.0);
+
+  const noteMsgs = h.sent.filter((m) => (m.bytes[0] & 0xf0) === 0x90 || (m.bytes[0] & 0xf0) === 0x80);
+  const ons = noteMsgs.filter((m) => (m.bytes[0] & 0xf0) === 0x90);
+  const offs = noteMsgs.filter((m) => (m.bytes[0] & 0xf0) === 0x80);
+  const cc = h.sent.filter((m) => (m.bytes[0] & 0xf0) === 0xb0);
+  console.log(`  за 8 с: noteOn ${ons.length}, noteOff ${offs.length} (ожидалось 16/16), CC ${cc.length} (только стартовый CC123)`);
+  check(ons.length === 16 && offs.length === 16, 'количество нотных сообщений');
+
+  let maxGateErr = 0;
+  let pairErr = 0;
+  for (let i = 0; i < ons.length; i++) {
+    maxGateErr = Math.max(maxGateErr, Math.abs((offs[i].ctxTime - ons[i].ctxTime) * 1000 - 62.5));
+    if (ons[i].bytes[1] !== offs[i].bytes[1]) pairErr++;
+  }
+  console.log(`  макс. ошибка длительности ноты (gate 62.5 мс): ${(maxGateErr * 1000).toExponential(2)} мкс; несовпавших пар: ${pairErr}`);
+  check(maxGateErr < 1e-6, 'длительность ноты ≠ gate');
+  check(pairErr === 0, 'номера нот в парах on/off не совпадают');
+
+  // Порядок: каждому noteOff предшествует noteOn той же ноты, «залипших» нет
+  const sounding = new Set();
+  let orderOk = true;
+  for (const m of [...noteMsgs].sort((a, b) => a.ctxTime - b.ctxTime)) {
+    const st = m.bytes[0] & 0xf0;
+    if (st === 0x90) sounding.add(m.bytes[1]);
+    else if (!sounding.delete(m.bytes[1])) orderOk = false;
+  }
+  check(orderOk && sounding.size === 0, 'нарушен порядок on→off или остались звучащие ноты');
+
+  const vels = ons.map((m) => m.bytes[2]).sort((a, b) => a - b);
+  console.log(`  velocity (по возрастанию): ${JSON.stringify(vels)}`);
+  // строки: 100, 90, 110, 100 → за 4 цикла отсортированно: 90×4, 100×8, 110×4
+  check(JSON.stringify(vels) === JSON.stringify([90, 90, 90, 90, 100, 100, 100, 100, 100, 100, 100, 100, 110, 110, 110, 110]), 'velocity не из матрицы');
+});
+
+/* ==================== C. смена BPM ==================== */
+
+await section('C. Смена BPM: граница шага и пересчёт лупа', async (check) => {
+  const h = makeHarness({ bpm: 120 });
+  await h.engine.initAudio();
+  h.engine.start();
+  const times = [];
+  h.engine.onStepTrigger = (step, abs, time) => times.push(time);
+
+  const run = (seconds) => {
+    const n = Math.round(seconds / 0.025);
+    for (let i = 0; i < n; i++) { h.advance(0.025); h.engine.consumeDueSteps(h.ctx.currentTime); }
+  };
+
+  run(4.0);
+  const beforeCount = times.length;
+  h.engine.setBpm(90);
+  run(4.0);
+
+  const oldD = 0.125;
+  const newD = 60 / 90 / 4;
+  const durs = [];
+  for (let k = 1; k < times.length; k++) durs.push(times[k] - times[k - 1]);
+  const switchIdx = durs.findIndex((d) => Math.abs(d - newD) < 1e-9);
+  const beforeClean = durs.slice(0, switchIdx).every((d) => Math.abs(d - oldD) < 1e-9);
+  const afterClean = durs.slice(switchIdx).every((d) => Math.abs(d - newD) < 1e-9);
+  console.log(`  шагов до/после смены: ${beforeCount}/${times.length - beforeCount}; новая длительность с шага №${switchIdx + 1}`);
+  console.log(`  интервалы 125 мс до смены: ${beforeClean ? 'ровно' : 'НЕРОВНО'}; ${fmtMs(newD)} мс после: ${afterClean ? 'ровно' : 'НЕРОВНО'}`);
+  check(beforeClean && afterClean, 'граница смены темпа не ровная');
+
+  const starts = h.sources.map((s) => s.startTime).filter((v) => v != null).sort((a, b) => a - b);
+  const lastLoopDur = starts[starts.length - 1] - starts[starts.length - 2];
+  const rates = [...new Set(h.sources.map((s) => +s.playbackRate.value.toFixed(6)))].sort((a, b) => a - b);
+  console.log(`  проходы лупа: последний интервал ${lastLoopDur.toFixed(6)} с (ожидалось ${(8 / 3).toFixed(6)} = такт @90); rate: ${rates.join(', ')}`);
+  check(Math.abs(lastLoopDur - 8 / 3) < 1e-6, 'луп после смены темпа не пересчитан');
+  check(rates.includes(1) && rates.some((r) => Math.abs(r - 4 / 3) < 1e-6), 'playbackRate не обновился под 90 BPM');
+});
+
+/* ==================== D. стоп ==================== */
+
+await section('D. Стоп: all-notes-off, отмена очередей, фейд лупа', async (check) => {
+  const h = makeHarness({ bpm: 120 });
+  await h.engine.initAudio();
+  h.engine.start();
+  h.advance(0.5);
+  h.engine.matrix[0][8] = 100; // шаг 8 → время 1.08: on ≈ 1.105, off ≈ 1.1675
+  h.advance(0.63); // стоп в 1.13 — нота звучит, её noteOff ещё в таймерах
+
+  const sounding = h.engine.midi.soundingNotes;
+  const pendingBefore = h.timers.size;
+  const before = h.sent.length;
+  h.engine.stop();
+  const after = h.sent.slice(before);
+
+  console.log(`  в момент стопа: звучит нот ${JSON.stringify(sounding)}, в таймерах ${pendingBefore}`);
+  console.log(`  при стопе дослано: ${after.map((m) => `[${m.bytes.join(',')}]`).join(' ')}`);
+  check(sounding.includes(60), 'нота 60 не звучала в момент стопа (тест некорректен)');
+  check(after.some((m) => m.bytes[0] === 0x80 && m.bytes[1] === 60), 'нет явного noteOff звучащей ноты');
+  check(after.some((m) => m.bytes[0] === 0xb0 && m.bytes[1] === 123), 'нет CC123 all-notes-off');
+  check(h.timers.size === 0, 'остались запланированные отправки');
+
+  const sentAtStop = h.sent.length;
+  h.advance(1.0);
+  check(h.sent.length === sentAtStop, 'после стопа ушли новые сообщения');
+  check(h.engine._loopSources.size === 0, 'проходы лупа не очищены');
+  const stopped = h.sources.filter((s) => s.stopTime != null);
+  console.log(`  остановлено проходов лупа: ${stopped.length} (фейд + stop, без щелчка)`);
+  check(stopped.length > 0, 'источники лупа не остановлены');
+  h.engine.stop(); // повторный стоп не должен падать и слать лишнее
+  check(h.sent.length === sentAtStop, 'повторный stop() отправил лишнее');
+});
+
+/* ==================== E. визуальная очередь ==================== */
+
+await section('E. Визуальная очередь: порядок и запаздывание', async (check) => {
+  const h = makeHarness({ bpm: 120 });
+  await h.engine.initAudio();
+  const events = [];
+  h.engine.onStepTrigger = (step, abs, time) => events.push({ step, abs, time, at: h.ctx.currentTime });
+  h.engine.start();
+  for (let i = 0; i < 160; i++) { h.advance(0.025); h.engine.consumeDueSteps(h.ctx.currentTime); }
+
+  let orderOk = true;
+  let latenessMax = -Infinity;
+  for (let i = 0; i < events.length; i++) {
+    if (events[i].abs !== i) orderOk = false;
+    latenessMax = Math.max(latenessMax, events[i].at - events[i].time);
+  }
+  console.log(`  событий: ${events.length} (ожидалось 32) — цикл ${events.slice(0, 17).map((e) => e.step + 1).join(',')}...`);
+  console.log(`  запаздывание подсветки ≤ ${fmtMs(latenessMax)} мс (обработка раз в 25 мс)`);
+  check(events.length === 32, `количество событий ${events.length} ≠ 32`);
+  check(orderOk, 'шаги идут с пропусками/дублями');
+  check(latenessMax <= 0.025 + 1e-9, 'запаздывание подсветки больше шага обработки');
+});
+
+/* ==================== прикладные проверки помощников ==================== */
+
+await section('F. Утилиты', async (check) => {
+  const cases = [
+    ['techno_128bpm.mp3', 128],
+    ['dnb_160bpm.mp3', 160],
+    ['loop_90BPM.wav', 90],
+    ['kick.mp3', null],
+  ];
+  for (const [name, want] of cases) {
+    check(parseBpmFromName(name) === want, `parseBpmFromName('${name}') ≠ ${want}`);
+  }
+  console.log(`  parseBpmFromName: ${cases.map(([n, w]) => `${n}→${w}`).join(', ')}`);
+});
+
+/* ==================== итог ==================== */
+
+console.log(`\nИТОГ: ${totalFails === 0 ? 'ВСЁ PASS' : `ПРОВАЛОВ: ${totalFails}`}`);
+process.exitCode = totalFails ? 1 : 0;
