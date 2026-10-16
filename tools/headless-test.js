@@ -14,7 +14,7 @@
  *
  * Запуск: npm test
  */
-import { SequencerEngine, parseBpmFromName } from '../engine.js';
+import { SequencerEngine, parseBpmFromName, MidiReceiver } from '../engine.js';
 
 /* ==================== фиктивный Web Audio ==================== */
 
@@ -343,6 +343,95 @@ await section('F. Утилиты', async (check) => {
     check(parseBpmFromName(name) === want, `parseBpmFromName('${name}') ≠ ${want}`);
   }
   console.log(`  parseBpmFromName: ${cases.map(([n, w]) => `${n}→${w}`).join(', ')}`);
+});
+
+/* ==================== G. MIDI-вход: парсер и подписки ==================== */
+
+await section('G. MidiReceiver: парсинг статусов, CC-подписки, отписка', async (check) => {
+  const r = new MidiReceiver();
+
+  // --- 1. Все типы статусов ---
+  const any = [];
+  r.onAny((m) => any.push(m));
+
+  r.feed([0x90, 60, 100], 1000);   // NoteOn  ch1
+  r.feed([0x80, 60, 0], 1001);      // NoteOff ch1
+  r.feed([0x91, 62, 0], 1002);      // NoteOn vel=0 → трактуем как NoteOff ch2
+  r.feed([0xb0, 74, 63], 1003);     // CC#74 = 63 ch1
+  r.feed([0xb1, 1, 127], 1004);     // CC#1 = 127 ch2
+  r.feed([0xc0, 5], 1005);          // ProgramChange #5 ch1
+  r.feed([0xe0, 0, 64], 1006);      // PitchBend: (64<<7)|0 = 8192 (центр)
+  r.feed([0xf0, 0x7e, 0x7f, 0x09, 0x01, 0xf7], 1007); // SysEx GM On
+  r.feed([0xa0, 60, 90], 1008);     // Poly Aftertouch
+  r.feed([0xd0, 100], 1009);        // Channel Aftertouch
+
+  const types = any.map((m) => m.type);
+  console.log(`  типы: ${types.join(', ')}`);
+  check(types[0] === 'noteOn' && any[0].note === 60 && any[0].velocity === 100, 'NoteOn распознан неверно');
+  check(types[1] === 'noteOff' && any[1].note === 60, 'NoteOff распознан неверно');
+  check(types[2] === 'noteOff' && any[2].velocity === 0 && any[2].channel === 1, 'NoteOn vel=0 не стал NoteOff');
+  check(types[3] === 'cc' && any[3].controller === 74 && any[3].value === 63 && any[3].channel === 0, 'CC#74 распознан неверно');
+  check(types[4] === 'cc' && any[4].channel === 1, 'канал CC не 2');
+  check(types[5] === 'pc' && any[5].program === 5, 'ProgramChange распознан неверно');
+  check(types[6] === 'pitchBend' && any[6].value === 8192, `PitchBend: ожидалось 8192, получено ${any[6].value}`);
+  check(types[7] === 'sysex', 'SysEx не распознан');
+  check(types[8] === 'polyAftertouch' && types[9] === 'channelAftertouch', 'Aftertouch не распознан');
+  check(any.length === 10, `ожидалось 10 сообщений, получено ${any.length}`);
+
+  // --- 2. Состояние CC (последние значения) ---
+  const st = r.ccState;
+  console.log(`  ccState: ${JSON.stringify(st)}`);
+  check(st[74] === 63 && st[1] === 127, 'ccState хранит неверные значения');
+
+  // --- 3. Подписка на конкретный CC ---
+  const cc74 = [];
+  const unsub74 = r.onCCNumber(74, (m) => cc74.push(m.value));
+  r.feed([0xb0, 74, 10]);
+  r.feed([0xb0, 74, 20]);
+  r.feed([0xb0, 1, 30]);    // другой CC — не должен попасть
+  check(cc74.length === 2 && cc74[0] === 10 && cc74[1] === 20, 'onCCNumber(74) сработал неверно');
+
+  // --- 4. Отписка ---
+  unsub74();
+  r.feed([0xb0, 74, 99]);
+  check(cc74.length === 2, 'отписка не сработала');
+
+  // --- 5. Ошибка в обработчике не ломает приёмник ---
+  const r2 = new MidiReceiver();
+  const seen = [];
+  r2.onAny(() => { throw new Error('boom'); });
+  r2.onAny((m) => seen.push(m.type));
+  r2.feed([0xb0, 5, 6]);
+  r2.feed([0x90, 60, 100]);
+  check(seen.length === 2, 'падающий обработчик заблокировал остальные');
+  check(r2.messageCount === 2, 'messageCount не увеличился');
+
+  // --- 6. Пустые/короткие сообщения не падают ---
+  const r3 = new MidiReceiver();
+  check(r3.feed([]) === null, 'пустой массив должен вернуть null');
+  check(r3.feed(null) === null, 'null должен вернуть null');
+  const shortMsg = r3.feed([0xc0, 3]);
+  check(shortMsg && shortMsg.type === 'pc' && shortMsg.program === 3, 'PC из 2 байт не распознан');
+
+  // --- 7. Подключение к фиктивному бэкенду ---
+  const listeners = new Set();
+  const fakeBackend = {
+    input: { name: 'fake-in' },
+    subscribeInput(h) { listeners.add(h); return true; },
+    unsubscribeInput(h) { listeners.delete(h); },
+  };
+  const r4 = new MidiReceiver();
+  const got = [];
+  r4.onAny((m) => got.push(m));
+  const ok = r4.connect(fakeBackend);
+  check(ok === true && listeners.size === 1, 'connect() не подписался на бэкенд');
+  // Эмулируем браузерное MIDIMessageEvent
+  const ev = { data: new Uint8Array([0xb0, 20, 42]), timeStamp: 12345 };
+  [...listeners][0](ev);
+  check(got.length === 1 && got[0].type === 'cc' && got[0].controller === 20 && got[0].value === 42,
+    'событие от бэкенда не дошло до приёмника');
+  r4.disconnect();
+  check(listeners.size === 0, 'disconnect() не отписался');
 });
 
 /* ==================== итог ==================== */

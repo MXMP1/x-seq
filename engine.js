@@ -51,9 +51,11 @@ export function parseBpmFromName(name) {
 
 /**
  * Бэкенд поверх Web MIDI API (USB-C подключение FM-1).
- * Задача: найти выход «FM-1» (или первый доступный) и уметь отправлять байты.
+ * Задача: найти выход и вход «FM-1» (или первые доступные) и уметь
+ * отправлять байты наружу и принимать входящие.
  * Интерфейс такой же, каким будет у BLE-бэкенда (Web Bluetooth) в следующем этапе:
- *   { name, sendNow(bytes), sendScheduled(bytes, perfMs), selectPort(id) }
+ *   { name, sendNow(bytes), sendScheduled(bytes, perfMs), selectPort(id),
+ *     subscribeInput(handler), unsubscribeInput(handler), selectInputPort(id) }
  */
 export class WebMidiBackend {
   /** @returns {boolean} есть ли Web MIDI в этом браузере */
@@ -62,8 +64,9 @@ export class WebMidiBackend {
   }
 
   /**
-   * Запрашивает доступ и выбирает выход. ВАЖНО: вызывать из обработчика
-   * жеста пользователя (клик по кнопке) — Chrome требует user gesture.
+   * Запрашивает доступ и выбирает выход и (если есть) вход.
+   * ВАЖНО: вызывать из обработчика жеста пользователя (клик по кнопке) —
+   * Chrome требует user gesture.
    * @param {{ preferredName?: string }} [options]
    */
   static async connect(options = {}) {
@@ -72,22 +75,25 @@ export class WebMidiBackend {
     }
     const access = await navigator.requestMIDIAccess();
     const outputs = [...access.outputs.values()];
-    if (!outputs.length) {
-      throw new Error('MIDI-выходы не найдены. Подключите FM-1 кабелем USB-C и разрешите доступ в диалоге Chrome.');
+    const inputs = [...access.inputs.values()];
+    if (!outputs.length && !inputs.length) {
+      throw new Error('MIDI-порты не найдены. Подключите FM-1 кабелем USB-C и разрешите доступ в диалоге Chrome.');
     }
     const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     const wanted = norm(options.preferredName ?? 'fm-1');
-    const output = outputs.find((p) => norm(p.name).includes(wanted)) ?? outputs[0];
-    return new WebMidiBackend(access, output);
+    const output = outputs.find((p) => norm(p.name).includes(wanted)) ?? outputs[0] ?? null;
+    const input = inputs.find((p) => norm(p.name).includes(wanted)) ?? inputs[0] ?? null;
+    return new WebMidiBackend(access, output, input);
   }
 
-  constructor(access, output) {
+  constructor(access, output, input = null) {
     this.access = access;
     this.output = output;
+    this.input = input;
   }
 
   get name() {
-    return this.output?.name ?? 'MIDI';
+    return this.output?.name ?? this.input?.name ?? 'MIDI';
   }
 
   /** Пользуемся ли мы встроенным планировщиком браузера (timestamp). */
@@ -97,11 +103,13 @@ export class WebMidiBackend {
 
   /** Отправить немедленно (тест-нота, all-notes-off, режим «своя очередь»). */
   sendNow(bytes) {
+    if (!this.output) throw new Error('MIDI-выход не выбран');
     this.output.send(bytes);
   }
 
   /** Отправить в момент perfMs (шкала performance.now()). Экспериментальный режим. */
   sendScheduled(bytes, perfMs) {
+    if (!this.output) throw new Error('MIDI-выход не выбран');
     this.output.send(bytes, perfMs);
   }
 
@@ -116,6 +124,208 @@ export class WebMidiBackend {
   listPorts() {
     return [...this.access.outputs.values()].map((p) => ({ id: p.id, name: p.name }));
   }
+
+  /* ---------- вход ---------- */
+
+  /**
+   * Подписать обработчик на сообщения входа.
+   * @param {(ev: {data: Uint8Array, timeStamp: number}) => void} handler
+   * @returns {boolean} удалось ли подписаться (false, если входа нет)
+   */
+  subscribeInput(handler) {
+    if (!this.input || typeof this.input.addEventListener !== 'function') return false;
+    this.input.addEventListener('midimessage', handler);
+    return true;
+  }
+
+  unsubscribeInput(handler) {
+    if (!this.input || typeof this.input.removeEventListener !== 'function') return;
+    this.input.removeEventListener('midimessage', handler);
+  }
+
+  /** Переключить вход по id. Старые подписки сбрасываются вызывающим кодом. */
+  selectInputPort(id) {
+    const inp = this.access.inputs.get(id);
+    if (inp) this.input = inp;
+    return this.input;
+  }
+
+  /** Список всех входов для UI. */
+  listInputs() {
+    return [...this.access.inputs.values()].map((p) => ({ id: p.id, name: p.name }));
+  }
+}
+
+/* ============================== MIDI-вход ============================== */
+
+/**
+ * Приёмник MIDI-сообщений (ноты/CC/PC/PitchBend/SysEx) от внешнего устройства.
+ *
+ * Зачем: FM-1 подключён по USB-C двусторонне — не только принимает ноты, но и
+ * шлёт наружу сообщения от своих ручек и кнопок. Мы их разбираем и раздаём
+ * подписчикам. Ничего «умного» тут нет — чистый парсер статус-байтов,
+ * который легко тестировать без железа (метод feed()).
+ *
+ * Форма нормализованного сообщения (аргумент подписчиков):
+ *   { type, channel, bytes, timestamp,
+ *     // для cc/noteOn/noteOff: note|controller, value|velocity
+ *     // для pc: program
+ *     // для pitchBend: value (0..16383)
+ *   }
+ */
+export class MidiReceiver {
+  constructor() {
+    this.backend = null;
+    this._subs = {
+      any: new Set(),
+      cc: new Set(),        // (msg) => void, любой CC
+      ccByNumber: new Map(),// cc# → Set<(msg) => void>
+      noteOn: new Set(),
+      noteOff: new Set(),
+      pc: new Set(),
+      pitchBend: new Set(),
+      sysex: new Set(),
+    };
+    this._ccState = new Map();   // cc# → последнее значение (для «лампочек» в UI)
+    this._messageCount = 0;
+    this._lastEvent = null;
+    // Привязанный обработчик — чтобы отписаться тем же референсом.
+    this._onMidiEvent = (ev) => {
+      const data = ev?.data ? [...ev.data] : [];
+      this.feed(data, ev?.timeStamp);
+    };
+  }
+
+  /**
+   * Подключиться к бэкенду (подписка на его вход).
+   * @returns {boolean} true, если вход есть и подписка удалась
+   */
+  connect(backend) {
+    this.disconnect();
+    this.backend = backend ?? null;
+    if (!this.backend || typeof this.backend.subscribeInput !== 'function') return false;
+    return this.backend.subscribeInput(this._onMidiEvent);
+  }
+
+  disconnect() {
+    if (this.backend && typeof this.backend.unsubscribeInput === 'function') {
+      try { this.backend.unsubscribeInput(this._onMidiEvent); } catch { /* уже отписан */ }
+    }
+    this.backend = null;
+  }
+
+  get connected() { return !!this.backend; }
+
+  /* ---------- подписки ---------- */
+
+  /** На любое входящее сообщение (нормализованное). @returns {() => void} отписаться */
+  onAny(fn) { this._subs.any.add(fn); return () => this._subs.any.delete(fn); }
+  /** На любой CC. */
+  onCC(fn) { this._subs.cc.add(fn); return () => this._subs.cc.delete(fn); }
+  /** На конкретный CC по номеру (0..127). */
+  onCCNumber(cc, fn) {
+    const key = cc & 0x7f;
+    if (!this._subs.ccByNumber.has(key)) this._subs.ccByNumber.set(key, new Set());
+    this._subs.ccByNumber.get(key).add(fn);
+    return () => this._subs.ccByNumber.get(key)?.delete(fn);
+  }
+  onNoteOn(fn) { this._subs.noteOn.add(fn); return () => this._subs.noteOn.delete(fn); }
+  onNoteOff(fn) { this._subs.noteOff.add(fn); return () => this._subs.noteOff.delete(fn); }
+  onPC(fn) { this._subs.pc.add(fn); return () => this._subs.pc.delete(fn); }
+  onPitchBend(fn) { this._subs.pitchBend.add(fn); return () => this._subs.pitchBend.delete(fn); }
+  onSysEx(fn) { this._subs.sysex.add(fn); return () => this._subs.sysex.delete(fn); }
+
+  /** Снять все подписки (используется при переключении порта, чтобы не дублировать). */
+  clearSubscriptions() {
+    for (const key of ['any', 'cc', 'noteOn', 'noteOff', 'pc', 'pitchBend', 'sysex']) {
+      this._subs[key].clear();
+    }
+    this._subs.ccByNumber.clear();
+  }
+
+  /* ---------- парсинг ---------- */
+
+  /**
+   * Скормить сырые байты (массив чисел) — точка входа из браузера и из тестов.
+   * @param {number[]} bytes
+   * @param {number} [timestamp] DOMHighResTimeStamp из MIDIMessageEvent
+   * @returns {object|null} нормализованное сообщение или null, если пустое
+   */
+  feed(bytes, timestamp = 0) {
+    if (!bytes || !bytes.length) return null;
+    const msg = this._parse(bytes, timestamp);
+    if (!msg) return null;
+    this._messageCount++;
+    this._lastEvent = msg;
+    if (msg.type === 'cc') this._ccState.set(msg.controller, msg.value);
+    // Раздаём подписчикам в порядке: конкретный CC → все CC → any
+    if (msg.type === 'cc') {
+      const set = this._subs.ccByNumber.get(msg.controller);
+      if (set) for (const fn of set) this._safe(fn, msg);
+      for (const fn of this._subs.cc) this._safe(fn, msg);
+    } else if (msg.type === 'noteOn') {
+      for (const fn of this._subs.noteOn) this._safe(fn, msg);
+    } else if (msg.type === 'noteOff') {
+      for (const fn of this._subs.noteOff) this._safe(fn, msg);
+    } else if (msg.type === 'pc') {
+      for (const fn of this._subs.pc) this._safe(fn, msg);
+    } else if (msg.type === 'pitchBend') {
+      for (const fn of this._subs.pitchBend) this._safe(fn, msg);
+    } else if (msg.type === 'sysex') {
+      for (const fn of this._subs.sysex) this._safe(fn, msg);
+    }
+    for (const fn of this._subs.any) this._safe(fn, msg);
+    return msg;
+  }
+
+  _safe(fn, msg) {
+    try { fn(msg); } catch (e) {
+      // Подписчик не должен ломать приёмник — пишем в консоль и живём дальше.
+      if (typeof console !== 'undefined') console.warn('MidiReceiver handler error', e);
+    }
+  }
+
+  _parse(bytes, timestamp) {
+    const status = bytes[0];
+    const base = {
+      bytes: [...bytes],
+      timestamp,
+      channel: status & 0x0f,
+    };
+    // SysEx: 0xF0 ... 0xF7 (или обрезанное 0xF0 без 0xF7 — тоже считаем)
+    if (status === 0xf0 || status === 0xf7) {
+      return { ...base, type: 'sysex', data: bytes.slice(1, status === 0xf7 ? bytes.length : -1) };
+    }
+    switch (status & 0xf0) {
+      case 0x80: // Note Off
+        return { ...base, type: 'noteOff', note: bytes[1], velocity: bytes[2] ?? 0 };
+      case 0x90: // Note On (velocity=0 трактуем как Note Off — стандартная практика)
+        if ((bytes[2] ?? 0) === 0) return { ...base, type: 'noteOff', note: bytes[1], velocity: 0 };
+        return { ...base, type: 'noteOn', note: bytes[1], velocity: bytes[2] };
+      case 0xa0: // Poly Aftertouch
+        return { ...base, type: 'polyAftertouch', note: bytes[1], value: bytes[2] };
+      case 0xb0: // Control Change
+        return { ...base, type: 'cc', controller: bytes[1], value: bytes[2] };
+      case 0xc0: // Program Change
+        return { ...base, type: 'pc', program: bytes[1] };
+      case 0xd0: // Channel Aftertouch
+        return { ...base, type: 'channelAftertouch', value: bytes[1] };
+      case 0xe0: // Pitch Bend (14 бит, LSB + MSB)
+        return { ...base, type: 'pitchBend', value: ((bytes[2] ?? 0) << 7) | (bytes[1] ?? 0) };
+      default:
+        return { ...base, type: 'system', status };
+    }
+  }
+
+  /* ---------- состояние ---------- */
+
+  /** Текущие значения всех CC, которые мы видели хотя бы раз. */
+  get ccState() {
+    return Object.fromEntries(this._ccState);
+  }
+
+  get messageCount() { return this._messageCount; }
+  get lastEvent() { return this._lastEvent; }
 }
 
 /**
@@ -329,6 +539,8 @@ export class SequencerEngine {
     });
     this.midi.channel = options.midiChannel ?? 0;
     this.midi.offsetMs = options.midiOffsetMs ?? 25;
+    /** Приёмник MIDI-входа (ручки/кнопки FM-1 как контроллёр). */
+    this.midiIn = new MidiReceiver();
 
     this._timerApi = options.timerApi ?? {
       setInterval: (fn, ms) => setInterval(fn, ms),
@@ -444,6 +656,23 @@ export class SequencerEngine {
   selectMidiPort(id) {
     const out = this.midi.backend?.selectPort?.(id) ?? null;
     return out;
+  }
+
+  /**
+   * Подключить приёмник к MIDI-входу того же бэкенда (или к отдельному).
+   * Подписки сохраняются — они живут в MidiReceiver, а не в порту.
+   * @returns {boolean} есть ли вход и удалась ли подписка
+   */
+  connectMidiInput(backend) {
+    return this.midiIn.connect(backend);
+  }
+
+  /** Переключить MIDI-вход по id; переподписываем приёмник на новый порт. */
+  selectMidiInputPort(id) {
+    const backend = this.midiIn.backend;
+    const inp = backend?.selectInputPort?.(id) ?? null;
+    if (inp) this.midiIn.connect(backend);
+    return inp;
   }
 
   /** Включить/выключить клетку матрицы. @returns {number} новая velocity (0 = выкл) */
@@ -649,6 +878,13 @@ export class SequencerEngine {
         soundingNotes: this.midi.soundingNotes,
         offsetMs: this.midi.offsetMs,
         useTimestamp: this.midi.useTimestamp,
+      },
+      midiIn: {
+        connected: this.midiIn.connected,
+        portName: this.midiIn.backend?.input?.name ?? null,
+        messageCount: this.midiIn.messageCount,
+        ccSeen: Object.keys(this.midiIn.ccState).map(Number),
+        lastEvent: this.midiIn.lastEvent,
       },
       loop: {
         loaded: !!buffer,

@@ -56,6 +56,21 @@
   .cell.active-col { outline: 2px solid var(--accent); outline-offset: -2px; }
   .cell.active-col.on { outline-color: #fff; }
   #debug { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11.5px; }
+
+  /* MIDI-вход: «лампочки» CC и лог */
+  #cc-lights { display: flex; flex-wrap: wrap; gap: 6px; min-height: 8px; }
+  .cc-chip { font-size: 11px; color: var(--text); background: #12151c; border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px 9px; display: inline-flex; align-items: center; gap: 6px;
+    font-variant-numeric: tabular-nums; transition: background .12s, border-color .12s; }
+  .cc-chip .n { color: var(--dim); }
+  .cc-chip.flash { background: #24402f; border-color: var(--on); }
+  #midi-in-log { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11.5px;
+    max-height: 180px; overflow: auto; background: #12151c; border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px; }
+  #midi-in-log .t { color: var(--dim); }
+  #midi-in-log .kind-cc { color: var(--accent); }
+  #midi-in-log .kind-note { color: var(--on); }
+  #midi-in-log .kind-other { color: #f0c674; }
 </style>
 </head>
 <body>
@@ -65,6 +80,7 @@
   <div class="chips">
     <span class="chip" id="chip-audio">аудио: —</span>
     <span class="chip" id="chip-midi">MIDI: нет</span>
+    <span class="chip" id="chip-midi-in">MIDI-вход: нет</span>
   </div>
 </header>
 
@@ -101,6 +117,19 @@
 </section>
 
 <section>
+  <div class="row">
+    <strong>MIDI-вход</strong>
+    <select id="midi-in" hidden></select>
+    <span class="hint" id="midi-in-status">не подключён — нажмите «Подключить MIDI» выше</span>
+    <button id="btn-clear-in-log" style="margin-left:auto">Очистить лог</button>
+  </div>
+  <div class="row hint">Крути ручки и жми кнопки FM-1 — сообщения появятся ниже. Номера CC,
+    которые пришлёт устройство, понадобятся для маппинга на параметры приложения.</div>
+  <div class="row" id="cc-lights"></div>
+  <div class="row"><pre class="hint" id="midi-in-log"></pre></div>
+</section>
+
+<section>
   <div class="row hint">Тап по клетке — включить/выключить ноту. 16 шагов = 1 такт (4/4, шаг 1/16),
     строки — ноты для FM-1.</div>
   <div class="grid-wrap" id="grid-wrap"><div class="grid" id="grid"></div></div>
@@ -133,8 +162,10 @@ const btnPlay = $('btn-play'), bpmIn = $('bpm'), loopSel = $('loop-file'), volIn
 const followCb = $('follow'), audioStatus = $('audio-status');
 const btnMidi = $('btn-midi'), midiOutSel = $('midi-out'), btnTest = $('btn-test-note');
 const offIn = $('midi-offset'), offVal = $('midi-offset-val'), midiStatus = $('midi-status'), tsCb = $('use-ts');
+const midiInSel = $('midi-in'), midiInStatus = $('midi-in-status'), btnClearLog = $('btn-clear-in-log');
+const ccLights = $('cc-lights'), midiInLog = $('midi-in-log');
 const gridWrap = $('grid-wrap'), grid = $('grid'), dbg = $('debug');
-const chipAudio = $('chip-audio'), chipMidi = $('chip-midi');
+const chipAudio = $('chip-audio'), chipMidi = $('chip-midi'), chipMidiIn = $('chip-midi-in');
 
 /* ============================ Сборка сетки ============================ */
 
@@ -306,7 +337,13 @@ btnMidi.addEventListener('click', async () => {
     const backend = await WebMidiBackend.connect(); // под требуемый user gesture
     engine.midi.connect(backend);
     renderPorts(backend);
-    backend.access.addEventListener?.('statechange', () => renderPorts(backend));
+    // MIDI-вход: если у бэкенда есть input — подписываем приёмник
+    const hasInput = engine.connectMidiInput(backend);
+    renderInputs(backend, hasInput);
+    backend.access.addEventListener?.('statechange', () => {
+      renderPorts(backend);
+      renderInputs(backend, engine.midiIn.connected);
+    });
     btnTest.disabled = false;
     midiStatus.textContent = `MIDI подключён: «${backend.name}»`;
     chipMidi.textContent = 'MIDI: ' + backend.name;
@@ -357,6 +394,124 @@ renderOffset();
 
 tsCb.addEventListener('change', () => { engine.midi.useTimestamp = tsCb.checked; });
 
+/* ============================ MIDI-вход: монитор ============================ */
+
+// Небольшой «буфер последних сообщений» — рисуем не каждый кадр, а пачками,
+// чтобы быстрые повороты ручек (десятки CC в секунду) не клали рендеринг.
+const LOG_MAX = 40;
+const logBuffer = [];
+let logDirty = false;
+
+function fmtTime(ts) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const p3 = (n) => String(n).padStart(3, '0');
+  return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${p3(d.getMilliseconds())}`;
+}
+
+function describeMsg(m) {
+  const ch = (m.channel ?? 0) + 1;
+  switch (m.type) {
+    case 'cc': return { cls: 'kind-cc', text: `CC#${m.controller} = ${m.value}  (кан. ${ch})` };
+    case 'noteOn': return { cls: 'kind-note', text: `NoteOn  ${m.note}  vel ${m.velocity}  (кан. ${ch})` };
+    case 'noteOff': return { cls: 'kind-note', text: `NoteOff ${m.note}  (кан. ${ch})` };
+    case 'pc': return { cls: 'kind-other', text: `ProgramChange #${m.program}  (кан. ${ch})` };
+    case 'pitchBend': return { cls: 'kind-other', text: `PitchBend ${m.value}  (кан. ${ch})` };
+    case 'sysex': return { cls: 'kind-other', text: `SysEx ${m.bytes.length} байт` };
+    case 'polyAftertouch': return { cls: 'kind-other', text: `PolyAT note ${m.note} = ${m.value}` };
+    case 'channelAftertouch': return { cls: 'kind-other', text: `ChanAT = ${m.value}` };
+    default: return { cls: 'kind-other', text: `status 0x${(m.status ?? m.bytes?.[0] ?? 0).toString(16)}` };
+  }
+}
+
+function pushLog(m) {
+  logBuffer.unshift({ time: performance.now(), msg: m });
+  if (logBuffer.length > LOG_MAX) logBuffer.length = LOG_MAX;
+  logDirty = true;
+}
+
+function renderLog() {
+  if (!logDirty) return;
+  logDirty = false;
+  midiInLog.textContent = logBuffer
+    .map((e) => `[${fmtTime(e.time)}] ${describeMsg(e.msg).text}`)
+    .join('\n');
+}
+
+/* ---------- «лампочки» CC: по одной на каждый уникальный номер ---------- */
+
+const ccChips = new Map(); // cc# → { el, valEl, flashTimer }
+
+function updateCcChip(cc, value) {
+  let entry = ccChips.get(cc);
+  if (!entry) {
+    const el = document.createElement('span');
+    el.className = 'cc-chip';
+    el.innerHTML = `<span class="n">CC#${cc}</span> <span class="v">0</span>`;
+    ccLights.appendChild(el);
+    entry = { el, valEl: el.querySelector('.v'), flashTimer: 0 };
+    ccChips.set(cc, entry);
+  }
+  entry.valEl.textContent = String(value);
+  entry.el.classList.add('flash');
+  clearTimeout(entry.flashTimer);
+  entry.flashTimer = setTimeout(() => entry.el.classList.remove('flash'), 140);
+}
+
+/* ---------- подписки на приёмник ---------- */
+
+engine.midiIn.onAny((m) => {
+  pushLog(m);
+  if (m.type === 'cc') updateCcChip(m.controller, m.value);
+});
+
+btnClearLog.addEventListener('click', () => {
+  logBuffer.length = 0;
+  midiInLog.textContent = '';
+  for (const { el } of ccChips.values()) el.remove();
+  ccChips.clear();
+});
+
+function renderInputs(backend, connected) {
+  const inputs = backend?.listInputs?.() ?? [];
+  if (!inputs.length) {
+    midiInSel.hidden = true;
+    midiInStatus.textContent = connected
+      ? 'приёмник подписан, но входов не видно'
+      : 'у устройства нет MIDI-входа (или Chrome его не отдал)';
+    chipMidiIn.textContent = 'MIDI-вход: нет';
+    chipMidiIn.classList.remove('live');
+    return;
+  }
+  midiInSel.innerHTML = '';
+  for (const p of inputs) {
+    const o = document.createElement('option');
+    o.value = p.id;
+    o.textContent = p.name;
+    midiInSel.appendChild(o);
+  }
+  if (backend.input) midiInSel.value = backend.input.id;
+  midiInSel.hidden = false;
+  if (connected) {
+    midiInStatus.textContent = `приём: «${backend.input?.name ?? '?'}» — крути ручки`;
+    chipMidiIn.textContent = 'MIDI-вход: ' + (backend.input?.name ?? 'есть');
+    chipMidiIn.classList.add('live');
+  } else {
+    midiInStatus.textContent = 'вход виден, но подписаться не удалось';
+    chipMidiIn.textContent = 'MIDI-вход: —';
+    chipMidiIn.classList.remove('live');
+  }
+}
+
+midiInSel.addEventListener('change', () => {
+  const inp = engine.selectMidiInputPort(midiInSel.value);
+  if (inp) {
+    midiInStatus.textContent = `приём: «${inp.name}» — крути ручки`;
+    chipMidiIn.textContent = 'MIDI-вход: ' + inp.name;
+    chipMidiIn.classList.add('live');
+  }
+});
+
 /* ============================ Дебаг-панель ============================ */
 
 setInterval(() => {
@@ -367,9 +522,12 @@ setInterval(() => {
   chipAudio.textContent = 'аудио: ' + (d.ctx ? d.ctx.state : '—');
   chipAudio.classList.toggle('live', d.ctx?.state === 'running');
 
+  renderLog();
+
   dbg.textContent =
     `шаг: ${d.isPlaying ? (d.absStep - 1) % d.steps + 1 : '—'} | тиков шедулера: ${d.ticks} | визуальных в очереди: ${d.scheduledUiEvents}\n` +
     `MIDI: ${d.midi.connected ? d.midi.backendName : 'нет'} — отправлено ${d.midi.sentCount}, в таймерах ${d.midi.pendingSends}, звучит нот ${d.midi.soundingNotes.length}, смещение ${d.midi.offsetMs} мс${d.midi.useTimestamp ? ', timestamp: вкл' : ''}\n` +
+    `MIDI-вход: ${d.midiIn.connected ? (d.midiIn.portName ?? 'есть') : 'нет'} — принято ${d.midiIn.messageCount}, CC замечено: [${d.midiIn.ccSeen.join(', ')}]\n` +
     `луп: ${d.loop.loaded ? `${d.loop.fileName} — ${d.loop.durationSec.toFixed(3)} с, ${d.loop.bars} такт(ов) @ ${d.loop.sourceBpm ?? '?'} BPM, играю ×${d.loop.effectiveRate.toFixed(3)}` : 'не загружен'}\n` +
     `аудио: ${ctxInfo} | lookahead ${d.lookaheadMs.toFixed(0)} мс | BPM ${d.bpm}`;
 }, 300);
