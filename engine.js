@@ -35,6 +35,38 @@ export const DEFAULT_ROWS = [
   { note: 71, label: 'B4' },
 ];
 
+/**
+ * Драмы-ваншоты из library/instruments. Играют через Web Audio по той же
+ * сетке, что и ноты FM-1. choke — группа взаимного глушения: новый хит
+ * гасит предыдущие в той же группе (открытый хэт срезает закрытый).
+ */
+export const DEFAULT_DRUM_ROWS = [
+  { id: 'kick', label: 'Kick', url: 'library/instruments/kick.mp3' },
+  { id: 'snare', label: 'Snare', url: 'library/instruments/snare.mp3' },
+  { id: 'chh', label: 'Hat закр.', url: 'library/instruments/closed_hihat.mp3', choke: 'hats' },
+  { id: 'ohh', label: 'Hat откр.', url: 'library/instruments/opened_hihat.mp3', choke: 'hats' },
+  { id: 'cym', label: 'Cymbal', url: 'library/instruments/cymbal.mp3' },
+  { id: 'clk', label: 'Click', url: 'library/instruments/click.mp3' },
+];
+
+/** Цикл velocity по долгому нажатию на включённую клетку. */
+export const VELOCITY_CYCLE = [64, 100, 127];
+
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+/** 60 → 'C4', 61 → 'C#4'. @param {number} note */
+export function noteLabel(note) {
+  const n = clamp(Math.round(Number(note)) || 0, 0, 127);
+  return NOTE_NAMES[n % 12] + (Math.floor(n / 12) - 1);
+}
+
+/** Расширить/обрезать строку матрицы до n столбцов с сохранением данных. */
+function resizeRow(arr, n) {
+  const out = new Array(n).fill(0);
+  for (let i = 0; i < Math.min(n, arr.length); i++) out[i] = arr[i];
+  return out;
+}
+
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 /**
@@ -508,9 +540,10 @@ export class SequencerEngine {
    * }} [options]
    */
   constructor(options = {}) {
-    this.rows = options.rows ?? DEFAULT_ROWS.map((r) => ({ ...r }));
+    this.rows = options.rows ?? DEFAULT_ROWS.map((r) => ({ ...r, muted: false }));
     this.steps = options.steps ?? 16;
     this.bpm = clamp(options.bpm ?? 120, 40, 240);
+    this.swing = clamp(options.swing ?? 0, 0, 0.5); // сдвиг нечётных шагов, в долях шага
     this.lookaheadSec = options.lookaheadSec ?? 0.1;
     this.hiddenLookaheadSec = options.hiddenLookaheadSec ?? 2.5;
     this.tickMs = options.tickMs ?? 25;
@@ -520,8 +553,21 @@ export class SequencerEngine {
     /** Матрица паттерна: matrix[row][step] = 0 (выкл) или velocity 1..127. */
     this.matrix = this.rows.map(() => new Array(this.steps).fill(0));
 
+    /** Драмы: отдельная матрица drumMatrix[row][step] = velocity. */
+    this.drumRows = options.drumRows ?? DEFAULT_DRUM_ROWS.map((r) => ({ ...r, muted: false, volume: 1 }));
+    this.drumMatrix = this.drumRows.map(() => new Array(this.steps).fill(0));
+    this.drumVolume = 1;
+    this._drumBuffers = new Map(); // id → AudioBuffer
+    this._drumSources = new Set(); // играющие хиты {src, gain, choke}
+    this._drumChokes = new Map(); // choke-группа → Set играющих хитов
+
+    /** Банки паттернов: banks[i] = снимок матриц или null (пусто). */
+    this.bankIndex = 0;
+    this.banks = Array.from({ length: 8 }, () => null);
+
     this.audioContext = options.audioContext ?? null;
     this.loopGain = null;
+    this.drumGain = null;
     this.loop = { url: null, buffer: null, sourceBpm: null, bars: 1, volume: 1 };
     this._loopCache = new Map();
 
@@ -591,6 +637,11 @@ export class SequencerEngine {
       this.loopGain.gain.value = this.loop.volume;
       this.loopGain.connect(this.audioContext.destination);
     }
+    if (!this.drumGain) {
+      this.drumGain = this.audioContext.createGain();
+      this.drumGain.gain.value = this.drumVolume;
+      this.drumGain.connect(this.audioContext.destination);
+    }
     return this.audioContext;
   }
 
@@ -636,6 +687,44 @@ export class SequencerEngine {
     }
   }
 
+  /* ---------- драм-сэмплы ---------- */
+
+  /**
+   * Загрузить и раскодировать все ваншоты из drumRows. Отсутствие файла не
+   * фатально: строка просто молчит, в консоль уходит предупреждение.
+   * @returns {Promise<string[]>} id загруженных сэмплов
+   */
+  async loadDrumSamples() {
+    if (!this.audioContext) throw new Error('Сначала вызовите initAudio()');
+    const ids = await Promise.all(this.drumRows.map(async (row) => {
+      if (this._drumBuffers.has(row.id)) return row.id;
+      try {
+        const res = await fetch(row.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buffer = await this.audioContext.decodeAudioData(await res.arrayBuffer());
+        this._drumBuffers.set(row.id, buffer);
+        return row.id;
+      } catch (e) {
+        if (typeof console !== 'undefined') console.warn(`драм-сэмпл ${row.url}: ${e.message}`);
+        return null;
+      }
+    }));
+    return ids.filter(Boolean);
+  }
+
+  /** Подставить готовый буфер (в тестах — фиктивный). */
+  setDrumSample(id, buffer) {
+    this._drumBuffers.set(id, buffer);
+  }
+
+  /** Общая громкость драмов (0..1). */
+  setDrumVolume(v) {
+    this.drumVolume = clamp(Number(v) || 0, 0, 1);
+    if (this.drumGain && this.audioContext) {
+      this.drumGain.gain.setTargetAtTime(this.drumVolume, this.audioContext.currentTime, 0.01);
+    }
+  }
+
   /* ---------- транспорт ---------- */
 
   setBpm(bpm) {
@@ -646,6 +735,90 @@ export class SequencerEngine {
     if (this.isPlaying && this._lastStepTime !== null) {
       this._nextStepTime = this._lastStepTime + this.stepDuration;
     }
+  }
+
+  /** Swing: 0 = ровно, 0.5 = максимальный сдвиг нечётных шагов. */
+  setSwing(v) {
+    this.swing = clamp(Number(v) || 0, 0, 0.5);
+  }
+
+  /** Длина паттерна: 16, 32 или 64 шага. Данные сохраняются по мере возможности. */
+  setSteps(n) {
+    const v = [16, 32, 64].includes(Number(n)) ? Number(n) : this.steps;
+    if (v === this.steps) return this.steps;
+    this.steps = v;
+    this.matrix = this.matrix.map((row) => resizeRow(row, v));
+    this.drumMatrix = this.drumMatrix.map((row) => resizeRow(row, v));
+    return this.steps;
+  }
+
+  /* ---------- строки (динамические) ---------- */
+
+  /** Добавить нотную строку. @returns {number} индекс новой строки */
+  addRow(note, label) {
+    const n = clamp(Math.round(Number(note)) || 60, 0, 127);
+    this.rows.push({ note: n, label: label ?? noteLabel(n), muted: false });
+    this.matrix.push(new Array(this.steps).fill(0));
+    return this.rows.length - 1;
+  }
+
+  /** Удалить нотную строку вместе с её данными. */
+  removeRow(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.rows.length) return false;
+    this.rows.splice(index, 1);
+    this.matrix.splice(index, 1);
+    return true;
+  }
+
+  setRowMuted(index, muted) {
+    if (this.rows[index]) this.rows[index].muted = !!muted;
+  }
+
+  setDrumRowMuted(index, muted) {
+    if (this.drumRows[index]) this.drumRows[index].muted = !!muted;
+  }
+
+  setDrumRowVolume(index, v) {
+    if (this.drumRows[index]) this.drumRows[index].volume = clamp(Number(v) || 0, 0, 1);
+  }
+
+  /* ---------- банки паттернов ---------- */
+
+  /** Снимок текущих матриц (глубокая копия). */
+  _snapshot() {
+    return {
+      matrix: this.matrix.map((r) => [...r]),
+      drumMatrix: this.drumMatrix.map((r) => [...r]),
+    };
+  }
+
+  _applySnapshot(snap) {
+    if (!snap) return;
+    this.matrix = snap.matrix.map((r) => resizeRow(r, this.steps));
+    this.drumMatrix = snap.drumMatrix.map((r) => resizeRow(r, this.steps));
+  }
+
+  /** Переключить банк: текущий сохраняется в старый индекс, новый загружается. */
+  selectBank(i) {
+    const idx = clamp(Math.floor(Number(i)) || 0, 0, this.banks.length - 1);
+    if (idx === this.bankIndex) return idx;
+    this.banks[this.bankIndex] = this._snapshot();
+    this.bankIndex = idx;
+    const saved = this.banks[idx];
+    if (saved) this._applySnapshot(saved);
+    else this.clearPattern();
+    return idx;
+  }
+
+  /** Скопировать содержимое банка from в банк to (не переключаясь). */
+  copyBank(from, to) {
+    const f = clamp(Math.floor(Number(from)) || 0, 0, this.banks.length - 1);
+    const t = clamp(Math.floor(Number(to)) || 0, 0, this.banks.length - 1);
+    const src = f === this.bankIndex ? this._snapshot() : this.banks[f];
+    this.banks[t] = src
+      ? { matrix: src.matrix.map((r) => [...r]), drumMatrix: src.drumMatrix.map((r) => [...r]) }
+      : null;
+    return t;
   }
 
   setMidiOffset(ms) {
@@ -683,9 +856,34 @@ export class SequencerEngine {
     return vel;
   }
 
-  /** Очистить паттерн. */
+  /** Задать velocity конкретной клетки (0 = выкл). */
+  setCellVelocity(row, step, vel) {
+    if (!this.matrix[row]) return 0;
+    const v = clamp(Math.round(Number(vel)) || 0, 0, 127);
+    this.matrix[row][step] = v;
+    return v;
+  }
+
+  /** Включить/выключить клетку драм-матрицы. */
+  toggleDrumCell(row, step) {
+    const cur = this.drumMatrix[row]?.[step];
+    const vel = cur > 0 ? 0 : this.velocity;
+    this.drumMatrix[row][step] = vel;
+    return vel;
+  }
+
+  /** Задать velocity клетки драмов. */
+  setDrumCellVelocity(row, step, vel) {
+    if (!this.drumMatrix[row]) return 0;
+    const v = clamp(Math.round(Number(vel)) || 0, 0, 127);
+    this.drumMatrix[row][step] = v;
+    return v;
+  }
+
+  /** Очистить паттерн (ноты и драмы текущего банка). */
   clearPattern() {
     for (const row of this.matrix) row.fill(0);
+    for (const row of this.drumMatrix) row.fill(0);
   }
 
   start() {
@@ -712,6 +910,7 @@ export class SequencerEngine {
     const releasedNotes = this.midi.allNotesOff();
     this._uiQueue.length = 0;
     this._stopLoopSources();
+    this._stopDrumSources();
     if (this.onTransportStop) this.onTransportStop(releasedNotes);
   }
 
@@ -755,25 +954,82 @@ export class SequencerEngine {
    */
   _scheduleStep(absStep, time) {
     const step = absStep % this.steps;
+    // Swing: нечётные шаги уезжают вправо на swing·stepDuration.
+    // Границы тактов (чётные шаги, старт лупа) не трогаем — сетка целая.
+    const t = time + (step % 2 === 1 ? this.swing * this.stepDuration : 0);
 
     // 1) Визуальная очередь (её разбирает rAF или тест)
-    this._uiQueue.push({ step, absStep, time });
+    this._uiQueue.push({ step, absStep, time: t });
 
     // 2) Ноты FM-1: noteOn на границе шага, noteOff — через gate
     for (let r = 0; r < this.rows.length; r++) {
       const vel = this.matrix[r][step];
-      if (!vel) continue;
+      if (!vel || this.rows[r].muted) continue;
       const note = this.rows[r].note;
-      this.midi.scheduleNoteOn(note, vel, time);
-      this.midi.scheduleNoteOff(note, time + this.stepDuration * this.gateRatio);
+      this.midi.scheduleNoteOn(note, vel, t);
+      this.midi.scheduleNoteOff(note, t + this.stepDuration * this.gateRatio);
     }
 
-    // 3) Луп: новый проход стартует на границе своего периода (своё число тактов).
+    // 3) Драмы: ваншоты из library/instruments по тем же аудио-часам
+    for (let r = 0; r < this.drumRows.length; r++) {
+      const vel = this.drumMatrix[r][step];
+      if (!vel || this.drumRows[r].muted) continue;
+      this._scheduleDrumHit(r, vel, t);
+    }
+
+    // 4) Луп: новый проход стартует на границе своего периода (своё число тактов).
     //    Перезапуск «бесшовный», потому что мы планируем его заранее, а не
     //    полагаемся на source.loop — так смена BPM аккуратно применяется на границе.
     if (this.loop.buffer && this.loopGain && absStep % (this.steps * this.loop.bars) === 0) {
       this._scheduleLoopPass(time);
     }
+  }
+
+  /**
+   * Запланировать один драм-хит на аудио-время t. Источник создаётся заранее
+   * (look-ahead) и стартует sample-точно; choke-группа гасит предыдущие хиты.
+   */
+  _scheduleDrumHit(rowIdx, vel, t) {
+    const row = this.drumRows[rowIdx];
+    const buffer = this._drumBuffers.get(row.id);
+    if (!buffer || !this.audioContext || !this.drumGain) return;
+    const ctx = this.audioContext;
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const gain = ctx.createGain();
+    gain.gain.value = (row.volume ?? 1) * clamp(vel, 1, 127) / 127;
+    src.connect(gain).connect(this.drumGain);
+
+    const entry = { src, gain, choke: row.choke ?? null };
+    this._drumSources.add(entry);
+    if (entry.choke) {
+      let group = this._drumChokes.get(entry.choke);
+      if (!group) { group = new Set(); this._drumChokes.set(entry.choke, group); }
+      for (const prev of group) this._fadeStopDrum(prev);
+      group.clear();
+      group.add(entry);
+    }
+    src.onended = () => {
+      this._drumSources.delete(entry);
+      if (entry.choke) this._drumChokes.get(entry.choke)?.delete(entry);
+      try { src.disconnect(); gain.disconnect(); } catch { /* браузер мог уже отключить */ }
+    };
+    src.start(t);
+  }
+
+  /** Микро-фейд и стоп одного драм-хита (choke / стоп транспорта). */
+  _fadeStopDrum(entry) {
+    const now = this.audioContext?.currentTime ?? 0;
+    try { entry.gain.gain.setTargetAtTime(0, now, 0.008); } catch { /* ok */ }
+    try { entry.src.stop(now + 0.03); } catch { /* уже остановлен */ }
+  }
+
+  /** Погасить все играющие драм-хиты (стоп транспорта). */
+  _stopDrumSources() {
+    if (!this._drumSources.size) return;
+    for (const entry of this._drumSources) this._fadeStopDrum(entry);
+    this._drumSources.clear();
+    this._drumChokes.clear();
   }
 
   /** Запланировать один проход лупа, растянутый точно на loop.bars тактов. */
@@ -840,6 +1096,72 @@ export class SequencerEngine {
 
   /* ---------- служебное ---------- */
 
+  /**
+   * Снимок всего состояния секвенсора для сохранения (localStorage).
+   * Банки сохраняются все; текущий банк кладётся и в banks[bankIndex].
+   */
+  serialize() {
+    const banks = this.banks.map((b, i) => (b ?? (i === this.bankIndex ? this._snapshot() : null)));
+    return {
+      v: 2,
+      bpm: this.bpm,
+      steps: this.steps,
+      swing: this.swing,
+      drumVolume: this.drumVolume,
+      loopUrl: this.loop.url,
+      rows: this.rows.map((r) => ({ note: r.note, label: r.label, muted: !!r.muted })),
+      drumRows: this.drumRows.map((r) => ({ id: r.id, muted: !!r.muted, volume: r.volume })),
+      bankIndex: this.bankIndex,
+      banks,
+    };
+  }
+
+  /**
+   * Восстановить состояние из объекта, полученного serialize().
+   * @returns {boolean} true, если данные подошли
+   */
+  restore(data) {
+    if (!data || data.v !== 2) return false;
+    this.setSteps(data.steps);
+    this.setBpm(data.bpm);
+    this.setSwing(data.swing);
+    this.setDrumVolume(data.drumVolume ?? 1);
+    if (typeof data.loopUrl === 'string') this.loop.url = data.loopUrl;
+    if (Array.isArray(data.rows) && data.rows.length) {
+      this.rows = data.rows.map((r) => ({
+        note: clamp(Math.round(Number(r.note)) || 60, 0, 127),
+        label: r.label ?? noteLabel(r.note),
+        muted: !!r.muted,
+      }));
+    }
+    if (Array.isArray(data.drumRows)) {
+      for (const saved of data.drumRows) {
+        const row = this.drumRows.find((r) => r.id === saved.id);
+        if (row) { row.muted = !!saved.muted; row.volume = clamp(Number(saved.volume ?? 1), 0, 1); }
+      }
+    }
+    if (Array.isArray(data.banks)) {
+      this.banks = Array.from({ length: 8 }, (_, i) => {
+        const b = data.banks[i];
+        if (!b || !Array.isArray(b.matrix) || !Array.isArray(b.drumMatrix)) return null;
+        return {
+          matrix: b.matrix.map((r) => resizeRow(r, this.steps)),
+          drumMatrix: b.drumMatrix.map((r) => resizeRow(r, this.steps)),
+        };
+      });
+    }
+    this.bankIndex = clamp(Math.floor(Number(data.bankIndex)) || 0, 0, this.banks.length - 1);
+    // Матрицы строк должны соответствовать rows по длине: пересобираем из банка.
+    const saved = this.banks[this.bankIndex];
+    if (saved && saved.matrix.length === this.rows.length && saved.drumMatrix.length === this.drumRows.length) {
+      this._applySnapshot(saved);
+    } else {
+      this.matrix = this.rows.map(() => new Array(this.steps).fill(0));
+      this.drumMatrix = this.drumRows.map(() => new Array(this.steps).fill(0));
+    }
+    return true;
+  }
+
   /** Возврат вкладки из фона: если играем — будим аудио-контекст. */
   _bindVisibility() {
     if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
@@ -886,6 +1208,14 @@ export class SequencerEngine {
         ccSeen: Object.keys(this.midiIn.ccState).map(Number),
         lastEvent: this.midiIn.lastEvent,
       },
+      drums: {
+        loaded: this._drumBuffers.size,
+        total: this.drumRows.length,
+        volume: this.drumVolume,
+        active: this._drumSources.size,
+      },
+      bank: this.bankIndex,
+      swing: this.swing,
       loop: {
         loaded: !!buffer,
         fileName: this.loop.url ? this.loop.url.split('/').pop() : null,

@@ -42,19 +42,30 @@
 
   /* Piano roll сетка */
   .grid-wrap { overflow-x: auto; padding-bottom: 4px; }
-  .grid { position: relative; display: grid; grid-template-columns: 52px repeat(16, 34px);
+  .grid { position: relative; display: grid; grid-template-columns: 74px repeat(16, 34px);
     gap: 3px; width: max-content; }
   .gnum { height: 22px; display: flex; align-items: center; justify-content: center;
     font-size: 11px; color: var(--dim); }
   .gnum.beat { color: var(--text); font-weight: 600; }
-  .glabel { height: 34px; display: flex; align-items: center; font-size: 12px; color: var(--dim);
-    position: sticky; left: 0; background: var(--card); z-index: 2; }
+  .glabel { height: 34px; display: flex; align-items: center; gap: 4px; font-size: 12px;
+    color: var(--dim); position: sticky; left: 0; background: var(--card); z-index: 2; }
+  .glabel .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .glabel.drum .name { color: #f0c674; }
+  .glabel button { font-size: 10px; padding: 2px 6px; min-height: 24px; min-width: 24px;
+    border-radius: 6px; line-height: 1; }
+  .glabel button.mute.on { background: #b63a2c; border-color: #b63a2c; color: #fff; }
+  .gsep { grid-column: 1 / -1; height: 6px; }
   .cell { height: 34px; border-radius: 6px; background: #12151c; border: 1px solid var(--line);
     touch-action: manipulation; }
   .cell.beat { background: var(--beat); }
   .cell.on { background: var(--on); border-color: var(--on); box-shadow: 0 0 8px rgba(61, 220, 132, .45); }
+  .cell.on.drum { background: #f0c674; border-color: #f0c674; box-shadow: 0 0 8px rgba(240, 198, 116, .4); }
+  .cell.rowmuted { opacity: .28 !important; }
   .cell.active-col { outline: 2px solid var(--accent); outline-offset: -2px; }
   .cell.active-col.on { outline-color: #fff; }
+  button.bank { padding: 6px 11px; min-height: 36px; font-weight: 600; }
+  button.bank.active { background: var(--accent); border-color: var(--accent); color: #08111f; }
+  button.bank.armed { background: #24402f; border-color: var(--on); color: var(--on); }
   #debug { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11.5px; }
 
   /* MIDI-вход: «лампочки» CC и лог */
@@ -94,6 +105,21 @@
     <label>Громкость <input id="loop-vol" type="range" min="0" max="1" step="0.01" value="1" /></label>
   </div>
   <div class="row">
+    <label>Шаги <select id="steps"><option value="16">16</option><option value="32">32</option><option value="64">64</option></select></label>
+    <label>Swing <input id="swing" type="range" min="0" max="50" step="1" value="0" />
+      <span class="hint" id="swing-val">0%</span></label>
+    <label>Драмы <input id="drum-vol" type="range" min="0" max="1" step="0.01" value="1" /></label>
+  </div>
+  <div class="row" id="banks-row">
+    <span class="hint">Банки:</span>
+    <button id="btn-copy-bank" title="Скопировать текущий банк в другой">⧉</button>
+    <button id="btn-clear">Очистить</button>
+  </div>
+  <div class="row">
+    <label>Новая строка: нота <input id="new-note" type="number" min="24" max="96" step="1" value="62" /></label>
+    <button id="btn-add-row">+ строка</button>
+  </div>
+  <div class="row">
     <label><input type="checkbox" id="follow" checked /> Следить за позицией</label>
   </div>
   <div class="row hint" id="audio-status"></div>
@@ -130,8 +156,9 @@
 </section>
 
 <section>
-  <div class="row hint">Тап по клетке — включить/выключить ноту. 16 шагов = 1 такт (4/4, шаг 1/16),
-    строки — ноты для FM-1.</div>
+  <div class="row hint">Тап — вкл/выкл ноту; <b>долгое нажатие</b> на включённой клетке — цикл громкости
+    64→100→127 (яркость клетки = velocity). «M» у строки — mute, «✕» — удалить строку.
+    Жёлтые строки внизу — драмы из library/instruments.</div>
   <div class="grid-wrap" id="grid-wrap"><div class="grid" id="grid"></div></div>
 </section>
 
@@ -140,7 +167,7 @@
 </section>
 
 <script type="module">
-import { SequencerEngine, WebMidiBackend } from './engine.js';
+import { SequencerEngine, WebMidiBackend, noteLabel, VELOCITY_CYCLE } from './engine.js';
 
 /* ============================ Конфигурация ============================ */
 
@@ -164,6 +191,9 @@ const btnMidi = $('btn-midi'), midiOutSel = $('midi-out'), btnTest = $('btn-test
 const offIn = $('midi-offset'), offVal = $('midi-offset-val'), midiStatus = $('midi-status'), tsCb = $('use-ts');
 const midiInSel = $('midi-in'), midiInStatus = $('midi-in-status'), btnClearLog = $('btn-clear-in-log');
 const ccLights = $('cc-lights'), midiInLog = $('midi-in-log');
+const stepsSel = $('steps'), swingIn = $('swing'), swingVal = $('swing-val'), drumVolIn = $('drum-vol');
+const banksRow = $('banks-row'), btnCopyBank = $('btn-copy-bank'), btnClear = $('btn-clear');
+const newNoteIn = $('new-note'), btnAddRow = $('btn-add-row');
 const gridWrap = $('grid-wrap'), grid = $('grid'), dbg = $('debug');
 const chipAudio = $('chip-audio'), chipMidi = $('chip-midi'), chipMidiIn = $('chip-midi-in');
 
@@ -176,11 +206,26 @@ for (const url of LOOP_FILES) {
   loopSel.appendChild(o);
 }
 
-const cols = engine.steps;
-const cellEls = []; // [row][step] → DOM-элемент
-const colEls = Array.from({ length: cols }, () => []); // [step] → все элементы столбца
+let cellEls = [];      // [row][step] → элемент нотной клетки
+let drumCellEls = [];  // [row][step] → элемент драм-клетки
+let colEls = [];       // [step] → все элементы столбца (для подсветки)
 
-{
+function paintCell(el, vel) {
+  if (!el) return;
+  el.classList.toggle('on', vel > 0);
+  // Яркость клетки = velocity: тусклее = тише.
+  el.style.opacity = vel > 0 ? (0.45 + 0.55 * (vel / 127)).toFixed(2) : '';
+}
+
+function buildGrid() {
+  const cols = engine.steps;
+  grid.innerHTML = '';
+  cellEls = [];
+  drumCellEls = [];
+  colEls = Array.from({ length: cols }, () => []);
+  activeCol = -1;
+  grid.style.gridTemplateColumns = `74px repeat(${cols}, 34px)`;
+
   const corner = document.createElement('div');
   grid.appendChild(corner);
   for (let s = 0; s < cols; s++) {
@@ -190,16 +235,51 @@ const colEls = Array.from({ length: cols }, () => []); // [step] → все эл
     grid.appendChild(n);
     colEls[s].push(n);
   }
-  engine.rows.forEach((row, r) => {
+
+  // Метка строки: имя + mute (+ удаление для нотных строк)
+  const makeLabel = (row, kind, index) => {
     const lab = document.createElement('div');
-    lab.className = 'glabel';
-    lab.textContent = row.label;
-    lab.title = `MIDI note ${row.note}`;
+    lab.className = 'glabel' + (kind === 'drum' ? ' drum' : '');
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = row.label;
+    if (kind === 'mel') name.title = `MIDI note ${row.note}`;
+    lab.appendChild(name);
+    const mute = document.createElement('button');
+    mute.className = 'mute' + (row.muted ? ' on' : '');
+    mute.textContent = 'M';
+    mute.addEventListener('click', () => {
+      const m = !row.muted;
+      if (kind === 'mel') engine.setRowMuted(index, m); else engine.setDrumRowMuted(index, m);
+      mute.classList.toggle('on', m);
+      const cells = kind === 'mel' ? cellEls[index] : drumCellEls[index];
+      for (const c of cells ?? []) c.classList.toggle('rowmuted', m);
+      saveState();
+    });
+    lab.appendChild(mute);
+    if (kind === 'mel') {
+      const del = document.createElement('button');
+      del.textContent = '✕';
+      del.title = 'Удалить строку';
+      del.addEventListener('click', () => {
+        if (engine.rows.length <= 1) return;
+        engine.removeRow(index);
+        buildGrid();
+        refreshGrid();
+        saveState();
+      });
+      lab.appendChild(del);
+    }
     grid.appendChild(lab);
+  };
+
+  engine.rows.forEach((row, r) => {
+    makeLabel(row, 'mel', r);
     cellEls[r] = [];
     for (let s = 0; s < cols; s++) {
       const c = document.createElement('div');
       c.className = 'cell' + (s % 4 === 0 ? ' beat' : '');
+      c.dataset.kind = 'mel';
       c.dataset.row = String(r);
       c.dataset.step = String(s);
       grid.appendChild(c);
@@ -207,13 +287,188 @@ const colEls = Array.from({ length: cols }, () => []); // [step] → все эл
       colEls[s].push(c);
     }
   });
-  // pointerdown — отзывчивее, чем click, на телефоне
-  grid.addEventListener('pointerdown', (e) => {
-    const t = e.target;
-    if (!t.classList?.contains('cell')) return;
-    const vel = engine.toggleCell(Number(t.dataset.row), Number(t.dataset.step));
-    t.classList.toggle('on', vel > 0);
-  }, { passive: true });
+
+  const sep = document.createElement('div');
+  sep.className = 'gsep';
+  grid.appendChild(sep);
+
+  engine.drumRows.forEach((row, r) => {
+    makeLabel(row, 'drum', r);
+    drumCellEls[r] = [];
+    for (let s = 0; s < cols; s++) {
+      const c = document.createElement('div');
+      c.className = 'cell drum' + (s % 4 === 0 ? ' beat' : '');
+      c.dataset.kind = 'drum';
+      c.dataset.row = String(r);
+      c.dataset.step = String(s);
+      grid.appendChild(c);
+      drumCellEls[r][s] = c;
+      colEls[s].push(c);
+    }
+  });
+}
+
+/** Перерисовать все клетки из матриц движка (смена банка, restore, resize). */
+function refreshGrid() {
+  const cols = engine.steps;
+  engine.matrix.forEach((rowArr, r) => {
+    const muted = !!engine.rows[r]?.muted;
+    for (let s = 0; s < cols; s++) {
+      paintCell(cellEls[r]?.[s], rowArr[s]);
+      cellEls[r]?.[s]?.classList.toggle('rowmuted', muted);
+    }
+  });
+  engine.drumMatrix.forEach((rowArr, r) => {
+    const muted = !!engine.drumRows[r]?.muted;
+    for (let s = 0; s < cols; s++) {
+      paintCell(drumCellEls[r]?.[s], rowArr[s]);
+      drumCellEls[r]?.[s]?.classList.toggle('rowmuted', muted);
+    }
+  });
+}
+
+/* ---------- тапы и долгое нажатие (velocity) ---------- */
+
+let pressTimer = 0;
+let pressFired = false;
+let pressTarget = null;
+
+grid.addEventListener('pointerdown', (e) => {
+  const t = e.target;
+  if (!t.classList?.contains('cell')) return;
+  pressTarget = t;
+  pressFired = false;
+  const kind = t.dataset.kind;
+  const r = Number(t.dataset.row), s = Number(t.dataset.step);
+  const vel = kind === 'mel' ? engine.matrix[r][s] : engine.drumMatrix[r][s];
+  if (vel > 0) {
+    // Долгое нажатие на включённой клетке — цикл velocity 64→100→127.
+    pressTimer = setTimeout(() => {
+      pressFired = true;
+      const cur = kind === 'mel' ? engine.matrix[r][s] : engine.drumMatrix[r][s];
+      const next = VELOCITY_CYCLE[(VELOCITY_CYCLE.indexOf(cur) + 1) % VELOCITY_CYCLE.length];
+      if (kind === 'mel') engine.setCellVelocity(r, s, next);
+      else engine.setDrumCellVelocity(r, s, next);
+      paintCell(t, next);
+      saveState();
+    }, 350);
+  }
+}, { passive: true });
+
+grid.addEventListener('pointerup', (e) => {
+  clearTimeout(pressTimer);
+  const t = e.target;
+  if (pressFired) { pressFired = false; return; }
+  if (!t.classList?.contains('cell') || t !== pressTarget) return;
+  const kind = t.dataset.kind;
+  const r = Number(t.dataset.row), s = Number(t.dataset.step);
+  const vel = kind === 'mel' ? engine.toggleCell(r, s) : engine.toggleDrumCell(r, s);
+  paintCell(t, vel);
+  saveState();
+}, { passive: true });
+
+grid.addEventListener('pointercancel', () => { clearTimeout(pressTimer); pressFired = false; });
+grid.addEventListener('contextmenu', (e) => e.preventDefault()); // long-press без меню
+
+/* ============================ Банки паттернов ============================ */
+
+let copyMode = false;
+const bankBtns = [];
+
+function renderBanks() {
+  bankBtns.forEach((b, i) => {
+    b.classList.toggle('active', i === engine.bankIndex);
+    b.classList.toggle('armed', copyMode && i !== engine.bankIndex);
+  });
+}
+
+function setCopyMode(v) {
+  copyMode = v;
+  btnCopyBank.classList.toggle('primary', v);
+  renderBanks();
+}
+
+function buildBanks() {
+  for (let i = 0; i < 8; i++) {
+    const b = document.createElement('button');
+    b.className = 'bank';
+    b.textContent = String.fromCharCode(65 + i);
+    b.addEventListener('click', () => {
+      if (copyMode) {
+        engine.copyBank(engine.bankIndex, i);
+        setCopyMode(false);
+        saveState();
+        return;
+      }
+      engine.selectBank(i);
+      renderBanks();
+      refreshGrid();
+      saveState();
+    });
+    banksRow.insertBefore(b, btnCopyBank);
+    bankBtns.push(b);
+  }
+  renderBanks();
+}
+
+btnCopyBank.addEventListener('click', () => setCopyMode(!copyMode));
+btnClear.addEventListener('click', () => {
+  engine.clearPattern();
+  refreshGrid();
+  saveState();
+});
+btnAddRow.addEventListener('click', () => {
+  engine.addRow(Number(newNoteIn.value));
+  buildGrid();
+  refreshGrid();
+  saveState();
+});
+stepsSel.addEventListener('change', () => {
+  engine.setSteps(Number(stepsSel.value));
+  buildGrid();
+  refreshGrid();
+  saveState();
+});
+swingIn.addEventListener('input', () => {
+  engine.setSwing(Number(swingIn.value) / 100);
+  swingVal.textContent = swingIn.value + '%';
+  saveState();
+});
+drumVolIn.addEventListener('input', () => {
+  engine.setDrumVolume(Number(drumVolIn.value));
+  saveState();
+});
+
+/* ============================ Сохранение состояния ============================ */
+
+const STORAGE_KEY = 'xseq.state.v2';
+let saveTimer = 0;
+
+function saveState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(engine.serialize())); } catch { /* quota/privacy */ }
+  }, 300);
+}
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return false;
+    return engine.restore(JSON.parse(raw));
+  } catch { return false; }
+}
+
+function syncControls() {
+  bpmIn.value = String(engine.bpm);
+  stepsSel.value = String(engine.steps);
+  swingIn.value = String(Math.round(engine.swing * 100));
+  swingVal.textContent = Math.round(engine.swing * 100) + '%';
+  drumVolIn.value = String(engine.drumVolume);
+  volIn.value = String(engine.loop.volume);
+  if (engine.loop.url && [...loopSel.options].some((o) => o.value === engine.loop.url)) {
+    loopSel.value = engine.loop.url;
+  }
 }
 
 /* ============================ Подсветка шага ============================ */
@@ -226,8 +481,8 @@ function highlight(step) {
   activeCol = step;
   for (const el of colEls[step]) el.classList.add('active-col');
   if (followCb.checked) {
-    const cell = cellEls[0][step];
-    gridWrap.scrollTo({
+    const cell = cellEls[0]?.[step];
+    if (cell) gridWrap.scrollTo({
       left: Math.max(0, cell.offsetLeft - gridWrap.clientWidth / 2 + cell.offsetWidth / 2),
       behavior: 'auto',
     });
@@ -281,14 +536,19 @@ btnPlay.addEventListener('click', async () => {
   audioStatus.textContent = 'загружаю луп…';
   try {
     await engine.initAudio(); // создаёт/будит AudioContext — тут нужен жест пользователя
-    await engine.loadLoopFromUrl(loopSel.value);
+    const [, drumIds] = await Promise.all([
+      engine.loadLoopFromUrl(loopSel.value),
+      engine.loadDrumSamples(),
+    ]);
     engine.start();
     updatePlayBtn();
     acquireWakeLock();
     const d = engine.getDebugInfo();
-    audioStatus.textContent = d.loop.loaded
-      ? `луп: ${d.loop.fileName} — ${d.loop.durationSec.toFixed(2)} с ≈ ${d.loop.bars} такт(ов) @ ${d.loop.sourceBpm ?? '?'} BPM, играю ×${d.loop.effectiveRate.toFixed(3)}`
-      : '';
+    audioStatus.textContent =
+      (d.loop.loaded
+        ? `луп: ${d.loop.fileName} — ${d.loop.durationSec.toFixed(2)} с ≈ ${d.loop.bars} такт(ов) @ ${d.loop.sourceBpm ?? '?'} BPM, играю ×${d.loop.effectiveRate.toFixed(3)}`
+        : 'луп не загружен') +
+      ` | драмы: ${drumIds.length}/${engine.drumRows.length}`;
   } catch (e) {
     audioStatus.textContent = 'ошибка: ' + e.message;
     audioStatus.classList.add('err');
@@ -301,14 +561,16 @@ btnPlay.addEventListener('click', async () => {
 bpmIn.addEventListener('change', () => {
   engine.setBpm(Number(bpmIn.value));
   bpmIn.value = String(engine.bpm); // показываем зажатое значение (40..240)
+  saveState();
 });
-volIn.addEventListener('input', () => engine.setLoopVolume(Number(volIn.value)));
+volIn.addEventListener('input', () => { engine.setLoopVolume(Number(volIn.value)); saveState(); });
 loopSel.addEventListener('change', async () => {
   if (!engine.audioContext) return; // загрузится при Play
   try {
     await engine.loadLoopFromUrl(loopSel.value); // подхватится на следующем такте
     const d = engine.getDebugInfo();
     audioStatus.textContent = `луп: ${d.loop.fileName} ≈ ${d.loop.bars} такт(ов), ×${d.loop.effectiveRate.toFixed(3)}`;
+    saveState();
   } catch (e) {
     audioStatus.textContent = 'ошибка: ' + e.message;
     audioStatus.classList.add('err');
@@ -526,12 +788,18 @@ setInterval(() => {
 
   dbg.textContent =
     `шаг: ${d.isPlaying ? (d.absStep - 1) % d.steps + 1 : '—'} | тиков шедулера: ${d.ticks} | визуальных в очереди: ${d.scheduledUiEvents}\n` +
+    `банк ${String.fromCharCode(65 + d.bank)} | шагов ${d.steps} | swing ${Math.round(d.swing * 100)}% | драмы: ${d.drums.loaded}/${d.drums.total} сэмплов, громк. ${d.drums.volume.toFixed(2)}, звучит ${d.drums.active}\n` +
     `MIDI: ${d.midi.connected ? d.midi.backendName : 'нет'} — отправлено ${d.midi.sentCount}, в таймерах ${d.midi.pendingSends}, звучит нот ${d.midi.soundingNotes.length}, смещение ${d.midi.offsetMs} мс${d.midi.useTimestamp ? ', timestamp: вкл' : ''}\n` +
     `MIDI-вход: ${d.midiIn.connected ? (d.midiIn.portName ?? 'есть') : 'нет'} — принято ${d.midiIn.messageCount}, CC замечено: [${d.midiIn.ccSeen.join(', ')}]\n` +
     `луп: ${d.loop.loaded ? `${d.loop.fileName} — ${d.loop.durationSec.toFixed(3)} с, ${d.loop.bars} такт(ов) @ ${d.loop.sourceBpm ?? '?'} BPM, играю ×${d.loop.effectiveRate.toFixed(3)}` : 'не загружен'}\n` +
     `аудио: ${ctxInfo} | lookahead ${d.lookaheadMs.toFixed(0)} мс | BPM ${d.bpm}`;
 }, 300);
 
+loadState(); // восстановление из localStorage (если было сохранено)
+buildBanks();
+buildGrid();
+refreshGrid();
+syncControls();
 updatePlayBtn();
 console.log('x-sequence: интерфейс готов. Нажмите «Запустить» (жест нужен для AudioContext).');
 </script>

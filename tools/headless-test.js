@@ -14,7 +14,7 @@
  *
  * Запуск: npm test
  */
-import { SequencerEngine, parseBpmFromName, MidiReceiver } from '../engine.js';
+import { SequencerEngine, parseBpmFromName, MidiReceiver, noteLabel } from '../engine.js';
 
 /* ==================== фиктивный Web Audio ==================== */
 
@@ -432,6 +432,133 @@ await section('G. MidiReceiver: парсинг статусов, CC-подпис
     'событие от бэкенда не дошло до приёмника');
   r4.disconnect();
   check(listeners.size === 0, 'disconnect() не отписался');
+});
+
+/* ==================== H. Секвенсор v2: swing, банки, шаги, драмы, serialize ==================== */
+
+await section('H. Секвенсор v2: swing, банки, resize, драмы, serialize/restore', async (check) => {
+  // --- 1. noteLabel ---
+  check(noteLabel(60) === 'C4' && noteLabel(61) === 'C#4' && noteLabel(0) === 'C-1' && noteLabel(127) === 'G9',
+    `noteLabel: ${noteLabel(60)},${noteLabel(61)},${noteLabel(0)},${noteLabel(127)}`);
+
+  // --- 2. setSteps: данные сохраняются при расширении и обрезке ---
+  {
+    const h = makeHarness();
+    h.engine.matrix[0][3] = 100;
+    h.engine.drumMatrix[0][5] = 90;
+    h.engine.setSteps(32);
+    check(h.engine.matrix[0][3] === 100 && h.engine.drumMatrix[0][5] === 90, 'resize 16→32 потерял данные');
+    check(h.engine.matrix[0].length === 32, 'resize 16→32 не расширил');
+    h.engine.matrix[0][20] = 70;
+    h.engine.setSteps(16);
+    check(h.engine.matrix[0][3] === 100 && h.engine.matrix[0][20] === undefined, 'resize 32→16 не обрезал');
+    check(h.engine.setSteps(24) === 16, 'setSteps(24) должен остаться 16');
+  }
+
+  // --- 3. Банки: переключение, изоляция, копирование ---
+  {
+    const h = makeHarness();
+    h.engine.matrix[0][0] = 100;
+    h.engine.selectBank(1);
+    check(h.engine.matrix[0][0] === 0, 'банк 1 должен быть пустым');
+    h.engine.matrix[1][2] = 80;
+    h.engine.selectBank(0);
+    check(h.engine.matrix[0][0] === 100 && h.engine.matrix[1][2] === 0, 'возврат в банк 0 не восстановил паттерн');
+    h.engine.copyBank(0, 3);
+    h.engine.selectBank(3);
+    check(h.engine.matrix[0][0] === 100, 'copyBank(0→3) не скопировал');
+    // правка банка 3 не трогает банк 0
+    h.engine.matrix[0][0] = 0;
+    h.engine.selectBank(0);
+    check(h.engine.matrix[0][0] === 100, 'правка банка 3 затронула банк 0');
+  }
+
+  // --- 4. Swing: нечётные шаги сдвинуты, чётные и старт лупа — нет ---
+  {
+    const h = makeHarness({ bpm: 120 });
+    h.engine.setSwing(0.25);
+    const times = [];
+    h.engine.onStepTrigger = (step, abs, time) => times.push(time);
+    await h.engine.initAudio();
+    h.engine.start();
+    for (let i = 0; i < 80; i++) { h.advance(0.025); h.engine.consumeDueSteps(h.ctx.currentTime); }
+    const stepDur = 0.125;
+    const start = times[0];
+    let ok = true;
+    for (let k = 0; k < times.length; k++) {
+      const want = start + k * stepDur + (k % 2 === 1 ? 0.25 * stepDur : 0);
+      if (Math.abs(times[k] - want) > 1e-9) ok = false;
+    }
+    console.log(`  swing 25%: первый шаг ${times[0].toFixed(4)}, второй ${(times[1] - times[0]).toFixed(4)} с (ожид. ${stepDur} и ${stepDur * 1.25})`);
+    check(ok, 'swing сдвинул шаги неверно');
+    check(Math.abs((times[1] - times[0]) - stepDur * 1.25) < 1e-9, 'нечётный интервал ≠ stepDur·1.25');
+    check(Math.abs((times[2] - times[1]) - stepDur * 0.75) < 1e-9, 'чётный интервал ≠ stepDur·0.75');
+  }
+
+  // --- 5. Драмы: хит стартует в своё время, choke глушит предыдущий ---
+  {
+    const h = makeHarness({ bpm: 120 });
+    await h.engine.initAudio();
+    const kickBuf = { duration: 0.2, sampleRate: 48000, _tag: 'kick' };
+    const chhBuf = { duration: 0.1, sampleRate: 48000, _tag: 'chh' };
+    const ohhBuf = { duration: 0.3, sampleRate: 48000, _tag: 'ohh' };
+    h.engine.setDrumSample('kick', kickBuf);
+    h.engine.setDrumSample('chh', chhBuf);
+    h.engine.setDrumSample('ohh', ohhBuf);
+    h.engine.drumMatrix[0][0] = 100; // kick step 0
+    h.engine.drumMatrix[2][0] = 90;  // closed hat step 0
+    h.engine.drumMatrix[3][4] = 90;  // open hat step 4 → должен заглушить closed hat
+    h.engine.start();
+    h.advance(1.0);
+
+    const drumSrcs = h.sources.filter((s) => s.buffer && s.buffer._tag);
+    const kick = drumSrcs.find((s) => s.buffer._tag === 'kick');
+    const chh = drumSrcs.find((s) => s.buffer._tag === 'chh');
+    const ohh = drumSrcs.find((s) => s.buffer._tag === 'ohh');
+    check(!!kick && Math.abs(kick.startTime - 0.08) < 1e-9, `kick startTime ${kick?.startTime} ≠ 0.08`);
+    check(!!chh && !!ohh, 'не все драм-хиты запланированы');
+    check(chh.stopTime != null, 'open hat не заглушил closed hat (choke не сработал)');
+    check(ohh.stopTime == null, 'open hat остановлен сам собой');
+    console.log(`  драм-источников: ${drumSrcs.length}; choke: chh.stop=${chh?.stopTime?.toFixed(3)}`);
+
+    // mute строки драмов
+    h.engine.stop();
+    h.engine.setDrumRowMuted(0, true);
+    const before = h.sources.length;
+    h.engine.start();
+    h.advance(0.5);
+    const newKicks = h.sources.slice(before).filter((s) => s.buffer?._tag === 'kick');
+    check(newKicks.length === 0, 'mute драм-строки не сработал');
+  }
+
+  // --- 6. serialize / restore: круговой проход ---
+  {
+    const h = makeHarness({ bpm: 120 });
+    h.engine.setBpm(132);
+    h.engine.setSteps(32);
+    h.engine.setSwing(0.3);
+    h.engine.setDrumVolume(0.6);
+    h.engine.addRow(62);
+    h.engine.matrix[0][1] = 111;
+    h.engine.drumMatrix[1][7] = 99;
+    h.engine.setRowMuted(2, true);
+    h.engine.selectBank(2);
+    h.engine.matrix[0][0] = 77;
+    const data = h.engine.serialize();
+
+    const h2 = makeHarness({ bpm: 120 });
+    const ok = h2.engine.restore(data);
+    check(ok === true, 'restore вернул false');
+    check(h2.engine.bpm === 132 && h2.engine.steps === 32, 'restore: bpm/steps');
+    check(Math.abs(h2.engine.swing - 0.3) < 1e-9, 'restore: swing');
+    check(Math.abs(h2.engine.drumVolume - 0.6) < 1e-9, 'restore: drumVolume');
+    check(h2.engine.rows.length === 5 && h2.engine.rows[4].note === 62, 'restore: rows');
+    check(h2.engine.rows[2].muted === true, 'restore: mute строки');
+    check(h2.engine.bankIndex === 2 && h2.engine.matrix[0][0] === 77, 'restore: текущий банк');
+    h2.engine.selectBank(0);
+    check(h2.engine.matrix[0][1] === 111 && h2.engine.drumMatrix[1][7] === 99, 'restore: банк 0');
+    check(h2.engine.restore({ v: 1 }) === false, 'restore старой версии должен вернуть false');
+  }
 });
 
 /* ==================== итог ==================== */
