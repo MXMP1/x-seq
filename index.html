@@ -120,6 +120,11 @@
     <button id="btn-add-row">+ строка</button>
   </div>
   <div class="row">
+    <label class="hint">.mid: <input id="midi-file" type="file" accept=".mid,.midi,audio/midi" /></label>
+    <button id="btn-export-mid">Экспорт .mid</button>
+    <span class="hint" id="midi-file-status"></span>
+  </div>
+  <div class="row">
     <label><input type="checkbox" id="follow" checked /> Следить за позицией</label>
   </div>
   <div class="row hint" id="audio-status"></div>
@@ -149,8 +154,21 @@
     <span class="hint" id="midi-in-status">не подключён — нажмите «Подключить MIDI» выше</span>
     <button id="btn-clear-in-log" style="margin-left:auto">Очистить лог</button>
   </div>
-  <div class="row hint">Крути ручки и жми кнопки FM-1 — сообщения появятся ниже. Номера CC,
-    которые пришлёт устройство, понадобятся для маппинга на параметры приложения.</div>
+  <div class="row">
+    <label>Запись с клавиш FM-1
+      <select id="input-mode">
+        <option value="off" selected>выкл</option>
+        <option value="step">STEP (нажатие → клетка)</option>
+        <option value="live">LIVE (овердаб на ходу)</option>
+      </select>
+    </label>
+    <button id="btn-reset-cursor" title="Вернуть курсор STEP-записи в начало">⏮ курсор</button>
+    <span class="hint" id="record-status"></span>
+  </div>
+  <div class="row hint">Стоковая прошивка FM-1 (проверено на v14/v15) передаёт только ноты с клавиш —
+    крутилки в порт не пишут. Поэтому запись идёт от клавиш: STEP — не нажимая Play,
+    каждое нажатие ставит ноту в клетку курсора; LIVE — транспорт играет, ноты
+    пишутся в текущий шаг. Новые ноты автоматически получают свою строку.</div>
   <div class="row" id="cc-lights"></div>
   <div class="row"><pre class="hint" id="midi-in-log"></pre></div>
 </section>
@@ -167,7 +185,7 @@
 </section>
 
 <script type="module">
-import { SequencerEngine, WebMidiBackend, noteLabel, VELOCITY_CYCLE } from './engine.js';
+import { SequencerEngine, WebMidiBackend, noteLabel, VELOCITY_CYCLE, parseMidiFile, buildPatternFromMidi, encodeMidiFile } from './engine.js';
 
 /* ============================ Конфигурация ============================ */
 
@@ -194,6 +212,8 @@ const ccLights = $('cc-lights'), midiInLog = $('midi-in-log');
 const stepsSel = $('steps'), swingIn = $('swing'), swingVal = $('swing-val'), drumVolIn = $('drum-vol');
 const banksRow = $('banks-row'), btnCopyBank = $('btn-copy-bank'), btnClear = $('btn-clear');
 const newNoteIn = $('new-note'), btnAddRow = $('btn-add-row');
+const midiFileIn = $('midi-file'), btnExportMid = $('btn-export-mid'), midiFileStatus = $('midi-file-status');
+const inputModeSel = $('input-mode'), btnResetCursor = $('btn-reset-cursor'), recordStatus = $('record-status');
 const gridWrap = $('grid-wrap'), grid = $('grid'), dbg = $('debug');
 const chipAudio = $('chip-audio'), chipMidi = $('chip-midi'), chipMidiIn = $('chip-midi-in');
 
@@ -438,6 +458,78 @@ drumVolIn.addEventListener('input', () => {
   engine.setDrumVolume(Number(drumVolIn.value));
   saveState();
 });
+
+/* ============================ MIDI-файлы: импорт / экспорт ============================ */
+
+midiFileIn.addEventListener('change', async () => {
+  const file = midiFileIn.files?.[0];
+  midiFileIn.value = ''; // повторный выбор того же файла тоже должен срабатывать
+  if (!file) return;
+  try {
+    const parsed = parseMidiFile(await file.arrayBuffer());
+    const pattern = buildPatternFromMidi(parsed);
+    if (!pattern) { midiFileStatus.textContent = `«${file.name}»: нот не найдено`; return; }
+    engine.importPattern(pattern);
+    buildGrid();
+    refreshGrid();
+    syncControls();
+    saveState();
+    const bps = Math.round(60000000 / parsed.usPerBeat);
+    midiFileStatus.textContent =
+      `«${file.name}»: ${pattern.rows.length} стр., ${pattern.steps} шаг., ~${bps} BPM`
+      + (pattern.truncated ? `, усечено ${pattern.truncated} нот (>64 шагов или >16 строк)` : '');
+  } catch (err) {
+    midiFileStatus.textContent = `Ошибка: ${err.message}`;
+  }
+});
+
+btnExportMid.addEventListener('click', () => {
+  const bytes = encodeMidiFile({
+    bpm: engine.bpm,
+    rows: engine.rows,
+    matrix: engine.matrix,
+    steps: engine.steps,
+    gateRatio: engine.gateRatio,
+  });
+  const letter = String.fromCharCode(65 + engine.bankIndex);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([bytes], { type: 'audio/midi' }));
+  a.download = `xseq-bank-${letter}-${engine.bpm}bpm.mid`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  midiFileStatus.textContent = `Сохранён ${a.download} (${bytes.length} байт)`;
+});
+
+/* ============================ Запись с клавиш FM-1 ============================ */
+
+function updateRecordStatus(extra = '') {
+  if (engine.inputMode === 'off') { recordStatus.textContent = extra || 'режим выключён'; return; }
+  recordStatus.textContent = extra ||
+    `${engine.inputMode.toUpperCase()} — курсор: шаг ${engine.recordCursor + 1}/${engine.steps}`;
+}
+
+inputModeSel.addEventListener('change', () => {
+  engine.setInputMode(inputModeSel.value);
+  updateRecordStatus();
+});
+btnResetCursor.addEventListener('click', () => {
+  engine.resetRecordCursor();
+  updateRecordStatus();
+});
+
+engine.onRecordEvent = (ev) => {
+  if (ev.skipped) {
+    updateRecordStatus(`пропущено: ${ev.reason} (${noteLabel(ev.note)})`);
+    return;
+  }
+  // Новая нота могла создать строку — пересобираем сетку, если размеры разошлись
+  if (engine.rows.length !== cellEls.length) buildGrid();
+  refreshGrid();
+  saveState();
+  updateRecordStatus(`шаг ${ev.step + 1}: ${noteLabel(ev.note)} vel ${ev.velocity}`
+    + (engine.inputMode === 'step' ? ` → курсор ${ev.cursor + 1}` : ''));
+};
+updateRecordStatus();
 
 /* ============================ Сохранение состояния ============================ */
 

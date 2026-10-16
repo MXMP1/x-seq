@@ -67,6 +67,180 @@ function resizeRow(arr, n) {
   return out;
 }
 
+/* ============================ MIDI-файлы (.mid) ============================ */
+
+/** Чтение variable-length quantity. @returns {[value, newPos]} */
+function readVLQ(b, p) {
+  let v = 0;
+  for (;;) {
+    const x = b[p++];
+    v = (v << 7) | (x & 0x7f);
+    if (!(x & 0x80)) return [v, p];
+  }
+}
+
+/** Запись VLQ в массив байтов. */
+function pushVLQ(arr, v) {
+  const bytes = [v & 0x7f];
+  v >>= 7;
+  while (v > 0) {
+    bytes.unshift((v & 0x7f) | 0x80);
+    v >>= 7;
+  }
+  for (const x of bytes) arr.push(x);
+}
+
+/**
+ * Минимальный парсер Standard MIDI File (format 0/1, PPQ-тайминг).
+ * Все треки сливаются в один список нот с абсолютными тиками; берётся первый
+ * темп-событие (или дефолт 500000 мкс/долю). SMPTE-тайминг не поддерживается.
+ * @param {ArrayBuffer|Uint8Array} data
+ * @returns {{format:number, tpq:number, usPerBeat:number, notes:{tick:number,endTick:number,note:number,vel:number}[]}}
+ */
+export function parseMidiFile(data) {
+  const b = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const tag = (off, n) => String.fromCharCode(...b.slice(off, off + n));
+  if (b.length < 14 || tag(0, 4) !== 'MThd') throw new Error('это не MIDI-файл (нет «MThd»)');
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const format = dv.getUint16(8);
+  const ntrks = dv.getUint16(10);
+  const division = dv.getUint16(12);
+  if (division & 0x8000) throw new Error('SMPTE-тайминг в .mid не поддерживается (нужен PPQ)');
+
+  const notes = [];
+  let usPerBeat = 500000;
+  let pos = 14;
+  for (let t = 0; t < ntrks && pos + 8 <= b.length; t++) {
+    if (tag(pos, 4) !== 'MTrk') break;
+    const len = dv.getUint32(pos + 4);
+    let p = pos + 8;
+    const end = Math.min(b.length, p + len);
+    let tick = 0;
+    let running = 0;
+    const held = new Map(); // (ch·128+note) → {tick, vel}
+    const closeHeld = (key, atTick) => {
+      const h = held.get(key);
+      if (!h) return;
+      notes.push({ tick: h.tick, endTick: atTick, note: key % 128, vel: h.vel });
+      held.delete(key);
+    };
+    while (p < end) {
+      let dt; [dt, p] = readVLQ(b, p);
+      tick += dt;
+      let status = b[p];
+      if (status & 0x80) { running = status; p++; } else status = running;
+      const type = status & 0xf0;
+      const ch = status & 0x0f;
+      if (type === 0x90 || type === 0x80) {
+        const note = b[p++] & 0x7f;
+        const vel = b[p++] & 0x7f;
+        const key = ch * 128 + note;
+        if (type === 0x90 && vel > 0) {
+          closeHeld(key, tick); // повторный note-on той же ноты = сначала off
+          held.set(key, { tick, vel });
+        } else {
+          closeHeld(key, tick);
+        }
+      } else if (type === 0xa0 || type === 0xb0 || type === 0xe0) p += 2;
+      else if (type === 0xc0 || type === 0xd0) p += 1;
+      else if (status === 0xff) {
+        const meta = b[p++];
+        let ln; [ln, p] = readVLQ(b, p);
+        if (meta === 0x51 && ln === 3) usPerBeat = (b[p] << 16) | (b[p + 1] << 8) | b[p + 2];
+        p += ln;
+      } else if (status === 0xf0 || status === 0xf7) {
+        let ln; [ln, p] = readVLQ(b, p);
+        p += ln;
+      } else p++;
+    }
+    for (const [key, h] of held) notes.push({ tick: h.tick, endTick: tick, note: key % 128, vel: h.vel });
+    pos = end;
+  }
+  notes.sort((x, y) => x.tick - y.tick || x.note - y.note);
+  return { format, tpq: division, usPerBeat, notes };
+}
+
+/**
+ * Раскладка распарсенных нот по нашей сетке: шаг = 1/16 (tpq/4 тиков),
+ * квантизация округлением, строки = уникальные высоты (сверху — высокие).
+ * Всё, что не влезло в 64 шага или свыше 16 строк, считается усечённым.
+ * @returns {{steps:number, rows:{note:number,label:string}[], matrix:number[][], truncated:number, totalSteps:number}|null}
+ */
+export function buildPatternFromMidi(parsed, { maxRows = 16 } = {}) {
+  const { tpq, notes } = parsed;
+  if (!notes?.length || !tpq) return null;
+  const stepTicks = tpq / 4;
+  const lastEnd = notes.reduce((m, n) => Math.max(m, n.endTick ?? n.tick), 0);
+  const totalSteps = Math.max(1, Math.ceil(lastEnd / stepTicks));
+  const steps = totalSteps <= 16 ? 16 : totalSteps <= 32 ? 32 : 64;
+  // Строки строим только из нот, попавших в сетку: усечённые не должны
+  // создавать пустые строки.
+  const quantized = notes.map((n) => ({ n, s: Math.round(n.tick / stepTicks) }));
+  const pitches = [...new Set(quantized.filter((q) => q.s < steps).map((q) => q.n.note))].sort((a, b) => b - a);
+  const rows = pitches.slice(0, maxRows).map((note) => ({ note, label: noteLabel(note), muted: false }));
+  const rowIndex = new Map(rows.map((r, i) => [r.note, i]));
+  const matrix = rows.map(() => new Array(steps).fill(0));
+  let truncated = 0;
+  for (const { n, s } of quantized) {
+    const ri = rowIndex.get(n.note);
+    if (ri === undefined || s >= steps) { truncated++; continue; }
+    matrix[ri][s] = Math.max(matrix[ri][s], n.vel);
+  }
+  return { steps, rows, matrix, truncated, totalSteps };
+}
+
+/**
+ * Кодировщик .mid (format 0, PPQ 480) из нашей матрицы: каждая включённая
+ * клетка = noteOn на своём шаге + noteOff через gateRatio шагов.
+ * @returns {Uint8Array} байты файла
+ */
+export function encodeMidiFile({ bpm, rows, matrix, steps, gateRatio = 0.5 }) {
+  const tpq = 480;
+  const stepTicks = tpq / 4;
+  const gateTicks = Math.max(1, Math.round(stepTicks * gateRatio));
+  const usPerBeat = clamp(Math.round(60000000 / (bpm || 120)), 8333, 1500000);
+
+  const events = [
+    { tick: 0, bytes: [0xff, 0x51, 0x03, (usPerBeat >> 16) & 0xff, (usPerBeat >> 8) & 0xff, usPerBeat & 0xff] },
+    { tick: 0, bytes: [0xff, 0x58, 0x04, 4, 2, 24, 8] }, // 4/4
+  ];
+  for (let r = 0; r < rows.length; r++) {
+    for (let s = 0; s < steps; s++) {
+      const vel = matrix[r]?.[s];
+      if (!vel) continue;
+      const note = rows[r].note & 0x7f;
+      const tick = s * stepTicks;
+      events.push({ tick, bytes: [0x90, note, clamp(vel, 1, 127)] });
+      events.push({ tick: tick + gateTicks, bytes: [0x80, note, 0] });
+    }
+  }
+  events.sort((a, b) => a.tick - b.tick);
+
+  const track = [];
+  let last = 0;
+  for (const ev of events) {
+    pushVLQ(track, ev.tick - last);
+    last = ev.tick;
+    for (const x of ev.bytes) track.push(x);
+  }
+  pushVLQ(track, 0);
+  track.push(0xff, 0x2f, 0x00);
+
+  const out = new Uint8Array(14 + 8 + track.length);
+  const dv = new DataView(out.buffer);
+  // MThd
+  out.set([0x4d, 0x54, 0x68, 0x64], 0);
+  dv.setUint32(4, 6);
+  dv.setUint16(8, 0);   // format 0
+  dv.setUint16(10, 1);  // один трек
+  dv.setUint16(12, tpq);
+  // MTrk
+  out.set([0x4d, 0x54, 0x72, 0x6b], 14);
+  dv.setUint32(18, track.length);
+  out.set(track, 22);
+  return out;
+}
+
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 /**
@@ -565,6 +739,13 @@ export class SequencerEngine {
     this.bankIndex = 0;
     this.banks = Array.from({ length: 8 }, () => null);
 
+    // Запись с клавиш FM-1 (стоковая прошивка шлёт только NoteOn/NoteOff).
+    this.inputMode = 'off'; // 'off' | 'live' | 'step'
+    this.onRecordEvent = null; // ({mode, step, row, note, velocity, skipped}) => void
+    this._inputSubscribed = false;
+    this._recordCursor = 0; // курсор STEP-записи (шаг)
+    this._currentStep = -1; // последний воспроизведённый шаг (для LIVE)
+
     this.audioContext = options.audioContext ?? null;
     this.loopGain = null;
     this.drumGain = null;
@@ -821,6 +1002,19 @@ export class SequencerEngine {
     return t;
   }
 
+  /**
+   * Заменить нотные строки и матрицу результатом импорта (.mid).
+   * Drum-дорожки не трогаем. Текущий слот банка синхронизируется со снимком.
+   * @returns {{rows:number, steps:number}}
+   */
+  importPattern({ rows, matrix, steps }) {
+    if (steps) this.setSteps(steps);
+    this.rows = rows.map((r) => ({ note: r.note, label: r.label ?? noteLabel(r.note), muted: false }));
+    this.matrix = this.rows.map((_, r) => resizeRow(matrix?.[r] || [], this.steps));
+    this.banks[this.bankIndex] = this._snapshot();
+    return { rows: this.rows.length, steps: this.steps };
+  }
+
   setMidiOffset(ms) {
     this.midi.offsetMs = clamp(Number(ms) || 0, -200, 200);
   }
@@ -837,7 +1031,65 @@ export class SequencerEngine {
    * @returns {boolean} есть ли вход и удалась ли подписка
    */
   connectMidiInput(backend) {
-    return this.midiIn.connect(backend);
+    const ok = this.midiIn.connect(backend);
+    // Одна сквозная подписка на ноты — для записи в сетку. Подписки живут
+    // в MidiReceiver, а не в порту, поэтому при смене порта не дублируются.
+    if (ok && !this._inputSubscribed) {
+      this._inputSubscribed = true;
+      this.midiIn.onNoteOn((m) => this._handleIncomingNote(m));
+    }
+    return ok;
+  }
+
+  /**
+   * Режим записи с внешнего входа (клавиши FM-1):
+   * 'off' — не пишем; 'step' — нажатие пишет ноту в клетку курсора и сдвигает
+   * курсор на шаг; 'live' — пишет в текущий шаг играющего транспорта (овердаб).
+   */
+  setInputMode(mode) {
+    this.inputMode = ['off', 'live', 'step'].includes(mode) ? mode : 'off';
+    return this.inputMode;
+  }
+
+  get recordCursor() { return this._recordCursor; }
+
+  /** Вернуть курсор STEP-записи в начало. */
+  resetRecordCursor() { this._recordCursor = 0; }
+
+  /** Нота с внешнего входа → запись в сетку (если режим включён). */
+  _handleIncomingNote(m) {
+    if (this.inputMode === 'off') return;
+    let step;
+    if (this.inputMode === 'live') {
+      if (!this.isPlaying || this._currentStep < 0) {
+        this._emitRecord({ skipped: true, reason: 'нет транспорта', note: m.note });
+        return;
+      }
+      step = this._currentStep;
+    } else {
+      step = this._recordCursor % this.steps;
+    }
+    let row = this.rows.findIndex((r) => r.note === m.note);
+    if (row < 0) {
+      if (this.rows.length >= 16) {
+        this._emitRecord({ skipped: true, reason: 'строки заполнены (16)', note: m.note });
+        return;
+      }
+      row = this.addRow(m.note);
+    }
+    const velocity = clamp(m.velocity, 1, 127);
+    this.matrix[row][step] = velocity;
+    if (this.inputMode === 'step') {
+      this._recordCursor = (this._recordCursor + 1) % this.steps;
+    }
+    this._emitRecord({ step, row, note: m.note, velocity });
+  }
+
+  _emitRecord(extra) {
+    if (typeof this.onRecordEvent === 'function') {
+      try { this.onRecordEvent({ mode: this.inputMode, cursor: this._recordCursor, ...extra }); }
+      catch (err) { console.warn('[engine] onRecordEvent error:', err); }
+    }
   }
 
   /** Переключить MIDI-вход по id; переподписываем приёмник на новый порт. */
@@ -1089,6 +1341,7 @@ export class SequencerEngine {
     while (this._uiQueue.length && this._uiQueue[0].time <= now) {
       const ev = this._uiQueue.shift();
       latest = ev;
+      this._currentStep = ev.step; // для LIVE-записи: пишем в последний сыгранный шаг
       if (this.onStepTrigger) this.onStepTrigger(ev.step, ev.absStep, ev.time);
     }
     return latest;

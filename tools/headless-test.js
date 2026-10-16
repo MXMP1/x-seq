@@ -14,7 +14,7 @@
  *
  * Запуск: npm test
  */
-import { SequencerEngine, parseBpmFromName, MidiReceiver, noteLabel } from '../engine.js';
+import { SequencerEngine, parseBpmFromName, MidiReceiver, noteLabel, parseMidiFile, buildPatternFromMidi, encodeMidiFile } from '../engine.js';
 
 /* ==================== фиктивный Web Audio ==================== */
 
@@ -558,6 +558,127 @@ await section('H. Секвенсор v2: swing, банки, resize, драмы, 
     h2.engine.selectBank(0);
     check(h2.engine.matrix[0][1] === 111 && h2.engine.drumMatrix[1][7] === 99, 'restore: банк 0');
     check(h2.engine.restore({ v: 1 }) === false, 'restore старой версии должен вернуть false');
+  }
+});
+
+/* ==================== I. MIDI-файлы и запись с клавиш ==================== */
+
+await section('I. MIDI-файлы (.mid) и запись с внешнего входа', async (check) => {
+  // --- 1. Кодировщик → парсер: круговой проход ---
+  const rows = [{ note: 60, label: 'C4' }, { note: 64, label: 'E4' }];
+  const matrix = [
+    [100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  ];
+  const bytes = encodeMidiFile({ bpm: 120, rows, matrix, steps: 16, gateRatio: 0.5 });
+  check(bytes[0] === 0x4d && bytes[1] === 0x54 && bytes[2] === 0x68 && bytes[3] === 0x64, 'нет сигнатуры MThd');
+  const parsed = parseMidiFile(bytes);
+  check(parsed.format === 0 && parsed.tpq === 480, 'заголовок: format/tpq');
+  check(parsed.usPerBeat === 500000, `темп из bpm=120: ${parsed.usPerBeat}`);
+  check(parsed.notes.length === 2, `нот в файле: ${parsed.notes.length} (ожидали 2)`);
+  const n0 = parsed.notes.find((n) => n.note === 60);
+  const n1 = parsed.notes.find((n) => n.note === 64);
+  check(n0 && n0.tick === 0 && n0.vel === 100 && n0.endTick === 60, 'нота C4: tick/vel/gate');
+  check(n1 && n1.tick === 480 && n1.vel === 90, 'нота E4: tick 480 (шаг 4), vel 90');
+
+  // --- 2. buildPatternFromMidi: раскладка по сетке, квантизация, усечение ---
+  const pat = buildPatternFromMidi({
+    tpq: 480,
+    notes: [
+      { tick: 0, endTick: 240, note: 60, vel: 100 },
+      { tick: 250, endTick: 480, note: 62, vel: 90 }, // округлится к шагу 2
+      { tick: 65 * 120, endTick: 66 * 120, note: 64, vel: 80 }, // за пределами 64 шагов
+    ],
+  });
+  check(pat && pat.steps === 64, `steps=${pat?.steps} (ожидали 64 под ~66 шагов)`);
+  check(pat.rows.length === 2 && pat.rows[0].note === 62 && pat.rows[1].note === 60, 'строки: уникальные высоты, сверху высокие');
+  check(pat.matrix[0][2] === 90 && pat.matrix[1][0] === 100, 'квантизация: tick 250 → шаг 2');
+  check(pat.truncated === 1 && pat.totalSteps === 66, `усечение: truncated=${pat.truncated}, total=${pat.totalSteps}`);
+  check(buildPatternFromMidi({ tpq: 480, notes: [] }) === null, 'пустой набор нот должен дать null');
+
+  // --- 3. parseMidiFile: защита от мусора ---
+  let threw = false;
+  try { parseMidiFile(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])); } catch { threw = true; }
+  check(threw, 'файл без MThd должен бросать ошибку');
+
+  // --- 4. importPattern в движок: строки, шаги, банк ---
+  {
+    const h = makeHarness({ bpm: 120 });
+    const imp = h.engine.importPattern({ rows: pat.rows, matrix: pat.matrix, steps: pat.steps });
+    check(imp.rows === 2 && imp.steps === 64, 'importPattern: размеры');
+    check(h.engine.matrix[0][2] === 90, 'importPattern: данные');
+    h.engine.selectBank(3);
+    h.engine.selectBank(0);
+    check(h.engine.matrix[0][2] === 90, 'importPattern: текущий банк сохранён');
+  }
+
+  // --- 5. STEP-запись с фиктивного входа ---
+  {
+    const h = makeHarness({ bpm: 120 });
+    const listeners = new Set();
+    const fakeBackend = {
+      input: { name: 'fake-in' },
+      subscribeInput(fn) { listeners.add(fn); return true; },
+      unsubscribeInput(fn) { listeners.delete(fn); },
+    };
+    check(h.engine.connectMidiInput(fakeBackend) === true, 'connectMidiInput к фиктивному бэкенду');
+    check(listeners.size === 1, 'приёмник не подписался на вход');
+    const fire = (b) => [...listeners][0]({ data: new Uint8Array(b), timeStamp: 0 });
+
+    const events = [];
+    h.engine.onRecordEvent = (ev) => events.push(ev);
+    h.engine.setInputMode('off');
+    fire([0x90, 60, 100]);
+    check(events.length === 0 && h.engine.matrix[0][0] === 0, 'в режиме off ноты не пишутся');
+
+    h.engine.setInputMode('step');
+    fire([0x90, 60, 100]); // строка 0 (C4), шаг курсора 0
+    check(h.engine.matrix[0][0] === 100, 'STEP: нота не записана в клетку курсора');
+    check(h.engine.recordCursor === 1, `STEP: курсор = ${h.engine.recordCursor}`);
+    fire([0x90, 60, 80]);
+    check(h.engine.matrix[0][1] === 80 && h.engine.recordCursor === 2, 'STEP: второе нажатие сдвинуло курсор');
+    fire([0x90, 69, 110]); // A4 — строки нет → создаётся
+    const lastEv = events[events.length - 1];
+    check(lastEv.row === h.engine.rows.length - 1 && h.engine.rows[lastEv.row].note === 69,
+      'STEP: новая нота создала строку');
+    check(h.engine.matrix[lastEv.row][lastEv.step] === 110, 'STEP: запись в новую строку');
+
+    // курсор доходит до конца и зацикливается
+    h.engine.resetRecordCursor();
+    for (let i = 0; i < 16; i++) fire([0x90, 60, 64]);
+    check(h.engine.recordCursor === 0, 'STEP: курсор зациклился после 16 шагов');
+
+    // лимит строк: 13 новых нот → 16 строк, дальше skipped
+    for (let n = 0; n < 13; n++) fire([0x90, 24 + n, 70]);
+    check(h.engine.rows.length === 16, `лимит строк: ${h.engine.rows.length}`);
+    const before = events.length;
+    fire([0x90, 20, 70]); // уже не влезает (нота 20 не среди 24..36 и 60,69)
+    const skipEv = events[events.length - 1];
+    check(events.length === before + 1 && skipEv.skipped === true, 'переполнение строк должно дать skipped-событие');
+
+    // --- 6. LIVE-запись: без транспорта пропускаем, на ходу — пишем в текущий шаг ---
+    const h2 = makeHarness({ bpm: 120 });
+    const listeners2 = new Set();
+    h2.engine.connectMidiInput({
+      input: { name: 'fake-in-2' },
+      subscribeInput(fn) { listeners2.add(fn); return true; },
+      unsubscribeInput(fn) { listeners2.delete(fn); },
+    });
+    const fire2 = (b) => [...listeners2][0]({ data: new Uint8Array(b), timeStamp: 0 });
+    const events2 = [];
+    h2.engine.onRecordEvent = (ev) => events2.push(ev);
+    h2.engine.setInputMode('live');
+    fire2([0x90, 60, 100]);
+    check(events2[0]?.skipped === true && events2[0].reason === 'нет транспорта', 'LIVE без транспорта: skipped');
+
+    await h2.engine.initAudio();
+    h2.engine.start();
+    for (let i = 0; i < 20; i++) { h2.advance(0.025); h2.engine.consumeDueSteps(h2.ctx.currentTime); }
+    const cur = h2.engine._currentStep;
+    check(cur >= 0, 'LIVE: на ходу _currentStep определён');
+    fire2([0x90, 60, 111]); // пишем, пока транспорт играет
+    check(h2.engine.matrix[0][cur] === 111, `LIVE: нота записана в шаг ${cur}`);
+    h2.engine.stop();
   }
 });
 
